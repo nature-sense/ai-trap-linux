@@ -1,0 +1,31 @@
+# .github/workflows/build-luckfox.yml
+name: Build Luckfox
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Luckfox toolchain deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf \
+            g++-arm-linux-gnueabihf cmake ninja-build \
+            python3-pip meson
+
+      - name: Build
+        run: |
+          meson setup build-luckfox \
+            --cross-file cross/luckfox.ini \
+            -Dtarget=v4l2 \
+            --buildtype=release
+          ninja -C build-luckfox
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: trap_v4l2
+          path: build-luckfox/trap_v4l2
