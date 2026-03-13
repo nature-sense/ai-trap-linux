@@ -5,6 +5,7 @@
 //  http_server.h  —  Lightweight single-threaded HTTP API server
 //
 //  Handles:
+//    GET  /api/trap            → JSON: trap id and location
 //    GET  /api/events          → redirects client to SseServer port (or proxies)
 //    GET  /api/status          → JSON: trap id, uptime, fps, db stats
 //    GET  /api/crops           → JSON: list of saved crop files
@@ -97,8 +98,9 @@ private:
     static void sendCors  (int fd);
 
     // JSON builders
+    std::string trapJson()    const;
     std::string statusJson()  const;
-    std::string cropsJson()         const;
+    std::string cropsJson()   const;
     std::string syncManifestJson(const SyncSession& sess) const;
     // JSON parsing helpers
     static std::vector<std::string> jsonStringArray(

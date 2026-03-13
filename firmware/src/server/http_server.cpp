@@ -286,6 +286,12 @@ void HttpServer::handleClient(int fd) {
 
 void HttpServer::routeGet(int fd, const Request& req) {
 
+    // GET /api/trap
+    if (req.path == "/api/trap") {
+        sendJson(fd, 200, trapJson());
+        return;
+    }
+
     // GET /api/status
     if (req.path == "/api/status") {
         sendJson(fd, 200, statusJson());
@@ -437,6 +443,15 @@ void HttpServer::routeDelete(int fd, const Request& req) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  JSON builders
 // ─────────────────────────────────────────────────────────────────────────────
+
+std::string HttpServer::trapJson() const {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"id\":%s,\"location\":%s}",
+        jsonStr(m_cfg.trapId).c_str(),
+        jsonStr(m_cfg.trapLocation).c_str());
+    return buf;
+}
 
 std::string HttpServer::statusJson() const {
     auto now     = std::chrono::steady_clock::now();
