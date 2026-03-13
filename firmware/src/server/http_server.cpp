@@ -193,6 +193,10 @@ void HttpServer::acceptLoop() {
                 fprintf(stderr, "HttpServer: accept: %s\n", strerror(errno));
             break;
         }
+        // Set a 5-second read timeout so hung clients don't leak threads
+        struct timeval tv{ 5, 0 };
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
         // Each request handled inline — all endpoints are fast except /api/crops/export
         // Detach so we can accept the next connection immediately
         std::thread([this, fd]{ handleClient(fd); ::close(fd); }).detach();
