@@ -6,8 +6,8 @@
 #    trap_config.toml  runtime config (not compiled)
 #
 #  Build targets (set with -Dtarget=):
-#    libcamera     Pi 5 + IMX708 via libcamera   → yolo_libcamera
-#    v4l2          Zero 3W / Pico Zero via V4L2   → yolo_v4l2
+#    libcamera     Pi 5 + IMX708 via libcamera         → yolo_libcamera
+#    v4l2          Luckfox Pico Zero + IMX415 via V4L2  → yolo_v4l2
 #    all           both (requires libcamera)
 #
 #  Examples:
@@ -67,7 +67,7 @@ if (target_opt == 'libcamera' or target_opt == 'all') and libcamera_dep.found()
   )
 endif
 
-# ── Radxa Zero 3W / Pico Zero / V4L2 target ──────────────────────────────────
+# ── Luckfox Pico Zero / IMX415 / V4L2 target ─────────────────────────────────
 
 if target_opt == 'v4l2' or target_opt == 'all'
   executable('yolo_v4l2',

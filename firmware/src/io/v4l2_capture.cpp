@@ -276,7 +276,7 @@ void V4L2Capture::captureLoop() {
             static_cast<int64_t>(buf.timestamp.tv_usec) * 1'000LL;
 
         // ── De-stride NV12 into compact buffer ────────────────────────────────
-        // RK3566 V4L2: single contiguous buffer, Y at offset 0, UV at stride*H.
+        // RV1103 RKISP: single contiguous buffer, Y at offset 0, UV at stride*H.
         // Unlike Pi 5 PiSP there are no per-plane DMA fd offsets to worry about.
         const int W = m_width;
         const int H = m_height;

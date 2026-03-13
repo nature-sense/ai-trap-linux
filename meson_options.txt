@@ -2,5 +2,5 @@ option('target',
   type    : 'combo',
   choices : ['libcamera', 'v4l2', 'all'],
   value   : 'libcamera',
-  description : 'Which capture backend to build: libcamera (Pi 5), v4l2 (Zero 3W), or all'
+  description : 'Which capture backend to build: libcamera (Pi 5), v4l2 (Luckfox Pico Zero), or all'
 )

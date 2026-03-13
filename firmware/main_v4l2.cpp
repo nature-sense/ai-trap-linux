@@ -49,7 +49,7 @@ int main(int argc, char* argv[]) {
     const char* device    = argc > 5 ? argv[5] : "/dev/video0";
 
     printf("══════════════════════════════════════════════════════════\n");
-    printf("  YOLO11n  Radxa Zero 3W  IMX219 V4L2 + ncnn + ByteTracker\n");
+    printf("  YOLO11n  Luckfox Pico Zero  IMX415 V4L2 + ncnn + ByteTracker\n");
     printf("══════════════════════════════════════════════════════════\n");
     printf("  model  : %s / %s\n  db     : %s\n"
            "  crops  : %s\n  device : %s\n\n",
@@ -174,22 +174,24 @@ int main(int argc, char* argv[]) {
         printf("Output layer: \"%s\"\n\n", outputName.c_str());
     }
 
-    // ── V4L2Capture — IMX219 (Radxa Camera 8M 219) ───────────────────────────
+    // ── V4L2Capture — Luckfox IMX415-98 IR-CUT Camera ────────────────────────
     //
-    // IMX219 sensor modes on RK3566 (Radxa Zero 3W):
-    //   3280 x 2464  @ 15 fps  — full resolution
-    //   1920 x 1080  @ 30 fps  — 1080p cropped
-    //   1640 x 1232  @ 30 fps  — 2x2 binned, full FOV  ← recommended
+    // IMX415 sensor modes on RV1103 (Luckfox Pico Zero):
+    //   3864 x 2192  @  7 fps  — full 4K (ISP bandwidth limited)
+    //   1920 x 1080  @ 30 fps  — 1080p  ← recommended
     //   1280 x  720  @ 60 fps  — high framerate
     //
     // Setup (once on board):
-    //   sudo rsetup → Overlays → enable imx219 → reboot
-    //   v4l2-ctl --list-formats-ext   # verify NV12 is offered
+    //   v4l2-ctl -d /dev/video0 --list-formats-ext   # verify NV12 offered
+    //   media-ctl --print-topology                   # confirm rkisp_mainpath
+    //
+    // IR-CUT: the cut filter is controlled externally (GPIO or rkaiq daemon).
+    // Day/night switching is handled outside this capture path.
 
     V4L2Config camCfg;
     camCfg.device        = device;
-    camCfg.captureWidth  = 1640;
-    camCfg.captureHeight = 1232;
+    camCfg.captureWidth  = 1920;
+    camCfg.captureHeight = 1080;
     camCfg.framerate     = 30;
     camCfg.bufferCount   = 4;
     camCfg.modelWidth    = 320;

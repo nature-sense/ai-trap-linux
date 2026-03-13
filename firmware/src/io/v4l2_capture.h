@@ -4,7 +4,7 @@
 //  V4L2Capture
 //
 //  Drop-in replacement for LibcameraCapture targeting V4L2 cameras such as
-//  the Radxa Camera 8M 219 (IMX219) on the Radxa Zero 3W (RK3566).
+//  the Luckfox IMX415-98 IR-CUT Camera on the Luckfox Pico Zero (RV1103).
 //
 //  Delivers the identical CaptureFrame struct so the rest of the pipeline
 //  (YoloDecoder, ByteTracker, SqliteWriter, CropSaver, MjpegStreamer) is
@@ -12,10 +12,16 @@
 //
 //  Pixel format
 //  ────────────
-//  Requests NV12 from the V4L2 driver.  RK3566 ISP outputs NV12 natively
+//  Requests NV12 from the V4L2 driver.  RV1103 RKISP outputs NV12 natively
 //  with a single contiguous buffer (no shared-fd plane quirk).
-//  On RK3566 the UV plane starts at exactly Y-plane-size bytes (stride * H),
-//  unlike Pi 5 / PiSP which uses per-plane DMA offsets.
+//  The UV plane starts at exactly Y-plane-size bytes (stride * H).
+//
+//  IR-CUT filter
+//  ─────────────
+//  The IMX415-98 IR-CUT camera switches between colour (day) and IR (night)
+//  modes.  The cut filter is typically controlled by a GPIO or V4L2 subdev
+//  control outside this capture path.  If using luckfox-sdk, the IR-CUT
+//  GPIO is usually exported at /sys/class/gpio/ or via the rkaiq ISP daemon.
 //
 //  Thread model
 //  ────────────
@@ -26,23 +32,22 @@
 //  normalise, then calls the user FrameCallback — identical to LibcameraCapture.
 //  Frames are dropped (oldest first) when the queue reaches MAX_QUEUE_DEPTH.
 //
-//  IMX219 sensor modes on RK3566 (Radxa Zero 3W):
-//    3280 x 2464  @ 15 fps  — full resolution
-//    1920 x 1080  @ 30 fps  — 1080p cropped
-//    1640 x 1232  @ 30 fps  — 2x2 binned, full FOV  ← recommended
+//  IMX415 sensor modes on RV1103 (Luckfox Pico Zero):
+//    3864 x 2192  @  7 fps  — full 4K (ISP bandwidth limited)
+//    1920 x 1080  @ 30 fps  — 1080p  ← recommended
 //    1280 x  720  @ 60 fps  — high framerate
 //
 //  Setup (once, on the board):
-//    sudo rsetup → Overlays → enable imx219
-//    reboot
-//    v4l2-ctl --list-formats-ext   # verify NV12 is offered
+//    # Confirm the RKISP main-path node and NV12 support:
+//    v4l2-ctl -d /dev/video0 --list-formats-ext
+//    media-ctl --print-topology   # identify rkisp_mainpath node
 //
 //  Usage
 //  ─────
 //    V4L2Config cfg;
 //    cfg.device       = "/dev/video0";
-//    cfg.captureWidth = 1640;
-//    cfg.captureHeight= 1232;
+//    cfg.captureWidth = 1920;
+//    cfg.captureHeight= 1080;
 //    cfg.framerate    = 30;
 //
 //    V4L2Capture cam;
@@ -109,11 +114,11 @@ struct V4L2Config {
     // V4L2 device node
     std::string device        = "/dev/video0";
 
-    // IMX219 on RK3566 — recommended modes:
-    //   1640x1232 @ 30fps  (2x2 binned, full FOV)
+    // IMX415 on RV1103 — recommended modes:
+    //   1920x1080 @ 30fps  (1080p, full HD)  ← default
     //   1280x720  @ 60fps  (high framerate)
-    int captureWidth          = 1640;
-    int captureHeight         = 1232;
+    int captureWidth          = 1920;
+    int captureHeight         = 1080;
     int framerate             = 30;
 
     // MMAP buffer count — 4 is a safe minimum
