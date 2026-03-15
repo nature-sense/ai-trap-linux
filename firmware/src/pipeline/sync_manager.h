@@ -41,6 +41,7 @@
 #include <vector>
 #include <mutex>
 #include <cstdint>
+#include <limits>
 
 // ── Crop record as stored in DB ───────────────────────────────────────────────
 
@@ -57,6 +58,12 @@ struct CropRecord {
     int         synced         = 0; // 0=new  1=acked  2=deleted
     std::string captureSession;    // e.g. "20260314_153042"
     std::string createdAt;
+
+    // Environmental sensor readings at time of crop save.
+    // NaN indicates the sensor was not available.
+    float temperatureC  = std::numeric_limits<float>::quiet_NaN(); // °C
+    float humidityPct   = std::numeric_limits<float>::quiet_NaN(); // % RH
+    float pressureHpa   = std::numeric_limits<float>::quiet_NaN(); // hPa
 };
 
 // ── Session returned to client ────────────────────────────────────────────────
@@ -109,7 +116,10 @@ public:
                       const std::string& label,
                       float confidence,
                       int64_t timestampUs,
-                      int64_t bytes);
+                      int64_t bytes,
+                      float temperatureC = std::numeric_limits<float>::quiet_NaN(),
+                      float humidityPct  = std::numeric_limits<float>::quiet_NaN(),
+                      float pressureHpa  = std::numeric_limits<float>::quiet_NaN());
 
     // ── Sync session API (called by HttpServer) ────────────────────────────────
 

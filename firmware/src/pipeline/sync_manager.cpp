@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <cmath>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <iomanip>
@@ -40,7 +42,10 @@ void SyncManager::createSchema()
             bytes           INTEGER NOT NULL DEFAULT 0,
             synced          INTEGER NOT NULL DEFAULT 0, -- 0=new 1=acked 2=deleted
             capture_session TEXT    NOT NULL DEFAULT '',
-            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+            temperature_c   REAL,   -- °C,  NULL if no sensor
+            humidity_pct    REAL,   -- % RH, NULL if no sensor
+            pressure_hpa    REAL    -- hPa,  NULL if no sensor
         )
     )");
 
@@ -62,6 +67,9 @@ void SyncManager::createSchema()
         "ALTER TABLE crops ADD COLUMN bytes           INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE crops ADD COLUMN synced          INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE crops ADD COLUMN capture_session TEXT    NOT NULL DEFAULT ''",
+        "ALTER TABLE crops ADD COLUMN temperature_c   REAL",
+        "ALTER TABLE crops ADD COLUMN humidity_pct    REAL",
+        "ALTER TABLE crops ADD COLUMN pressure_hpa    REAL",
         nullptr
     };
     for (int i = 0; migrations[i]; ++i) {
@@ -90,7 +98,10 @@ void SyncManager::registerCrop(const std::string& file,
                                 const std::string& label,
                                 float confidence,
                                 int64_t timestampUs,
-                                int64_t bytes)
+                                int64_t bytes,
+                                float temperatureC,
+                                float humidityPct,
+                                float pressureHpa)
 {
     std::lock_guard<std::mutex> lk(m_mutex);
     if (!m_db) return;
@@ -105,23 +116,34 @@ void SyncManager::registerCrop(const std::string& file,
     sqlite3_stmt* stmt = nullptr;
     const char* sql =
         "INSERT OR IGNORE INTO crops "
-        "(file, path, track_id, class_id, label, confidence, timestamp_us, bytes, synced, capture_session) "
-        "VALUES (?,?,?,?,?,?,?,?,0,?)";
+        "(file, path, track_id, class_id, label, confidence, timestamp_us, bytes, synced, "
+        " capture_session, temperature_c, humidity_pct, pressure_hpa) "
+        "VALUES (?,?,?,?,?,?,?,?,0,?,?,?,?)";
 
     if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         fprintf(stderr, "SyncManager: prepare registerCrop failed: %s\n",
                 sqlite3_errmsg(m_db));
         return;
     }
-    sqlite3_bind_text  (stmt, 1, relFile.c_str(),             -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text  (stmt, 2, path.c_str(),                -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int   (stmt, 3, trackId);
-    sqlite3_bind_int   (stmt, 4, classId);
-    sqlite3_bind_text  (stmt, 5, label.c_str(),               -1, SQLITE_TRANSIENT);
-    sqlite3_bind_double(stmt, 6, static_cast<double>(confidence));
-    sqlite3_bind_int64 (stmt, 7, timestampUs);
-    sqlite3_bind_int64 (stmt, 8, bytes);
-    sqlite3_bind_text  (stmt, 9, m_currentSessionId.c_str(),  -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text  (stmt,  1, relFile.c_str(),             -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text  (stmt,  2, path.c_str(),                -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int   (stmt,  3, trackId);
+    sqlite3_bind_int   (stmt,  4, classId);
+    sqlite3_bind_text  (stmt,  5, label.c_str(),               -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt,  6, static_cast<double>(confidence));
+    sqlite3_bind_int64 (stmt,  7, timestampUs);
+    sqlite3_bind_int64 (stmt,  8, bytes);
+    sqlite3_bind_text  (stmt,  9, m_currentSessionId.c_str(),  -1, SQLITE_TRANSIENT);
+
+    // Environmental fields: bind NULL when sensor not available (NaN sentinel)
+    auto bindReal = [&](int col, float v) {
+        if (std::isnan(v)) sqlite3_bind_null  (stmt, col);
+        else               sqlite3_bind_double(stmt, col, static_cast<double>(v));
+    };
+    bindReal(10, temperatureC);
+    bindReal(11, humidityPct);
+    bindReal(12, pressureHpa);
+
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 }
@@ -401,9 +423,17 @@ std::vector<CropRecord> SyncManager::queryPending() const
     sqlite3_stmt* stmt = nullptr;
     sqlite3_prepare_v2(m_db,
         "SELECT id, file, path, track_id, class_id, label, "
-        "       confidence, timestamp_us, bytes, synced, capture_session, created_at "
+        "       confidence, timestamp_us, bytes, synced, capture_session, created_at, "
+        "       temperature_c, humidity_pct, pressure_hpa "
         "FROM crops WHERE synced=0 ORDER BY created_at ASC",
         -1, &stmt, nullptr);
+
+    const float kNaN = std::numeric_limits<float>::quiet_NaN();
+    auto readReal = [&](int col) -> float {
+        return (sqlite3_column_type(stmt, col) == SQLITE_NULL)
+               ? kNaN
+               : static_cast<float>(sqlite3_column_double(stmt, col));
+    };
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CropRecord r;
@@ -420,6 +450,9 @@ std::vector<CropRecord> SyncManager::queryPending() const
         const auto* cs   = sqlite3_column_text (stmt, 10);
         r.captureSession = cs ? reinterpret_cast<const char*>(cs) : "";
         r.createdAt      = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 11));
+        r.temperatureC   = readReal(12);
+        r.humidityPct    = readReal(13);
+        r.pressureHpa    = readReal(14);
         out.push_back(r);
     }
     sqlite3_finalize(stmt);

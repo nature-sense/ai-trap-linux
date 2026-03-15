@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -225,7 +226,16 @@ int main(int argc, char* argv[]) {
         struct stat st{};
         int64_t bytes = (::stat(path.c_str(), &st) == 0)
                         ? static_cast<int64_t>(st.st_size) : 0;
-        sync.registerCrop(filename, trackId, classId, cls, conf, timestampUs, bytes);
+
+        // TODO: replace stubs with real BME280/BME680 sensor readings.
+        // NaN causes NULL to be stored in the DB (sensor not fitted).
+        const float kNaN = std::numeric_limits<float>::quiet_NaN();
+        float tempC  = kNaN;
+        float humPct = kNaN;
+        float presHpa= kNaN;
+
+        sync.registerCrop(filename, trackId, classId, cls, conf, timestampUs, bytes,
+                          tempC, humPct, presHpa);
     });
 
     http.setAfTriggerCallback([&]() {

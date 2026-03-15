@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <cmath>
 #include <stdexcept>
 #include <chrono>
 #include <cstdio>
@@ -113,17 +114,30 @@ std::string HttpServer::syncManifestJson(const SyncSession& sess) const
     for (const auto& c : sess.crops) {
         if (!first) out += ',';
         first = false;
-        char item[512];
+
+        // Environmental fields serialised as null when not available (NaN sentinel)
+        auto realOrNull = [](float v) -> std::string {
+            if (std::isnan(v)) return "null";
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.2f", v);
+            return buf;
+        };
+
+        char item[640];
         snprintf(item, sizeof(item),
                  "{\"file\":\"%s\",\"bytes\":%lld,"
                  "\"trackId\":%d,\"label\":\"%s\","
-                 "\"conf\":%.4f,\"timestampUs\":%lld}",
+                 "\"conf\":%.4f,\"timestampUs\":%lld,"
+                 "\"temperatureC\":%s,\"humidityPct\":%s,\"pressureHpa\":%s}",
                  c.file.c_str(),
                  static_cast<long long>(c.bytes),
                  c.trackId,
                  c.label.c_str(),
                  c.confidence,
-                 static_cast<long long>(c.timestampUs));
+                 static_cast<long long>(c.timestampUs),
+                 realOrNull(c.temperatureC).c_str(),
+                 realOrNull(c.humidityPct).c_str(),
+                 realOrNull(c.pressureHpa).c_str());
         out += item;
     }
     out += "]}";
@@ -540,7 +554,8 @@ std::string HttpServer::cropsJson() const {
         sqlite3* rawDb = m_db->rawDb();
         sqlite3_stmt* s = nullptr;
         const char* sql =
-            "SELECT file, bytes, track_id, label, confidence, timestamp_us, capture_session "
+            "SELECT file, bytes, track_id, label, confidence, timestamp_us, capture_session,"
+            "       temperature_c, humidity_pct, pressure_hpa "
             "FROM crops WHERE synced != 2 ORDER BY created_at DESC";
         if (sqlite3_prepare_v2(rawDb, sql, -1, &s, nullptr) == SQLITE_OK) {
             while (sqlite3_step(s) == SQLITE_ROW) {
@@ -551,24 +566,38 @@ std::string HttpServer::cropsJson() const {
                 double      conf    = sqlite3_column_double(s, 4);
                 int64_t     tsUs    = sqlite3_column_int64 (s, 5);
                 const char* sess    = reinterpret_cast<const char*>(sqlite3_column_text(s, 6));
+                // Environmental fields — NULL in DB becomes "null" in JSON
+                auto realOrNull = [&](int col) -> std::string {
+                    if (sqlite3_column_type(s, col) == SQLITE_NULL) return "null";
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%.2f", sqlite3_column_double(s, col));
+                    return buf;
+                };
+                std::string tempStr = realOrNull(7);
+                std::string humStr  = realOrNull(8);
+                std::string presStr = realOrNull(9);
 
                 if (!file) continue;
                 if (!first) out += ',';
                 first = false;
 
-                char entry[640];
+                char entry[768];
                 snprintf(entry, sizeof(entry),
                     "{\"file\":%s,\"bytes\":%lld,"
                     "\"trackId\":%d,\"conf\":%.4f,"
                     "\"timestampUs\":%lld,\"label\":\"%s\","
-                    "\"session\":\"%s\"}",
+                    "\"session\":\"%s\","
+                    "\"temperatureC\":%s,\"humidityPct\":%s,\"pressureHpa\":%s}",
                     jsonStr(std::string(file)).c_str(),
                     (long long)bytes,
                     trackId,
                     conf,
                     (long long)tsUs,
                     label ? label : "",
-                    sess  ? sess  : "");
+                    sess  ? sess  : "",
+                    tempStr.c_str(),
+                    humStr.c_str(),
+                    presStr.c_str());
                 out += entry;
             }
             sqlite3_finalize(s);
