@@ -113,7 +113,11 @@ inc = include_directories([
 
 # ── Pi 5 / libcamera target ───────────────────────────────────────────────────
 
-if (target_opt == 'libcamera' or target_opt == 'all') and libcamera_dep.found()
+if target_opt == 'libcamera' or target_opt == 'all'
+  if not libcamera_dep.found()
+    error('target=libcamera requires libcamera. ' +
+          'On the Luckfox cross-build host use -Dtarget=v4l2 instead.')
+  endif
   executable('yolo_libcamera',
     sources : shared_sources + files(
       'firmware/src/io/libcamera_capture.cpp',
