@@ -158,6 +158,28 @@ jobs:
           cmake --install ncnn-build
           rm -rf ncnn-src ncnn-build
 
+      # ── pkg-config wrapper ──────────────────────────────────────────────────
+      #
+      # Meson looks for a pkg-config binary named after the cross tuple for
+      # machine 1 queries.  We create a thin wrapper that hard-wires
+      # PKG_CONFIG_LIBDIR to the sysroot so the real pkg-config finds our
+      # cross-built .pc files.
+
+      - name: Create pkg-config wrapper for target
+        run: |
+          WRAPPER=/usr/local/bin/${{ env.CROSS }}-pkg-config
+          sudo tee "$WRAPPER" > /dev/null << 'SCRIPT'
+          #!/bin/sh
+          export PKG_CONFIG_DIR=
+          export PKG_CONFIG_LIBDIR=SYSROOT_PLACEHOLDER/usr/lib/pkgconfig:SYSROOT_PLACEHOLDER/usr/share/pkgconfig
+          export PKG_CONFIG_SYSROOT_DIR=SYSROOT_PLACEHOLDER
+          exec pkg-config "$@"
+          SCRIPT
+          sudo sed -i "s|SYSROOT_PLACEHOLDER|${{ env.SYSROOT }}|g" "$WRAPPER"
+          sudo chmod +x "$WRAPPER"
+          # Smoke-test
+          "$WRAPPER" --version
+
       # ── Generate cross file with real CI paths ──────────────────────────────
       #
       # The checked-in cross/luckfox-rv1106.ini has paths for local dev.
@@ -165,27 +187,38 @@ jobs:
       # regardless of runner home directory.
 
       - name: Generate CI cross file
+        env:
+          BIN:     ${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}
+          SYSROOT: ${{ env.SYSROOT }}
         run: |
-          BIN="${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}"
-          cat > cross/luckfox-rv1106-ci.ini << EOF
-          [binaries]
-          c         = '${BIN}-gcc'
-          cpp       = '${BIN}-g++'
-          ar        = '${BIN}-ar'
-          strip     = '${BIN}-strip'
-          objcopy   = '${BIN}-objcopy'
-          pkg-config = 'pkg-config'
+          python3 - << 'PYEOF'
+          import os, pathlib
+          bin     = os.environ["BIN"]
+          sysroot = os.environ["SYSROOT"]
+          cross   = "arm-rockchip830-linux-uclibcgnueabihf"
+          content = f"""
+[binaries]
+c          = '{bin}-gcc'
+cpp        = '{bin}-g++'
+ar         = '{bin}-ar'
+strip      = '{bin}-strip'
+objcopy    = '{bin}-objcopy'
+pkg-config = '/usr/local/bin/{cross}-pkg-config'
 
-          [host_machine]
-          system     = 'linux'
-          cpu_family = 'arm'
-          cpu        = 'cortex-a7'
-          endian     = 'little'
+[host_machine]
+system     = 'linux'
+cpu_family = 'arm'
+cpu        = 'cortex-a7'
+endian     = 'little'
 
-          [properties]
-          sys_root          = '${{ env.SYSROOT }}'
-          pkg_config_libdir = '${{ env.SYSROOT }}/usr/lib/pkgconfig:${{ env.SYSROOT }}/usr/share/pkgconfig'
-          EOF
+[properties]
+sys_root          = '{sysroot}'
+pkg_config_libdir = '{sysroot}/usr/lib/pkgconfig:{sysroot}/usr/share/pkgconfig'
+cmake_prefix_path = ['{sysroot}/usr']
+""".lstrip()
+          pathlib.Path('cross/luckfox-rv1106-ci.ini').write_text(content)
+          print(content)
+          PYEOF
 
       # ── Meson configure + build ─────────────────────────────────────────────
 
