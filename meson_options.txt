@@ -4,3 +4,11 @@ option('target',
   value   : 'libcamera',
   description : 'Which capture backend to build: libcamera (Pi 5), v4l2 (Luckfox Pico Zero), or all'
 )
+
+option('luckfox_sysroot',
+  type    : 'string',
+  value   : '',
+  description : 'Path to sysroot containing cross-compiled NCNN and SQLite3 for the RV1106 target. '\
+                'Overrides sys_root in cross/luckfox-rv1106.ini. '\
+                'Leave empty to rely on the cross file or pkg-config from PATH.'
+)
