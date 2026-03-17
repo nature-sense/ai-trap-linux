@@ -88,15 +88,10 @@ omp_dep       = dependency('openmp',  required : false)
 libcamera_dep = dependency('libcamera', required : false)
 
 if is_arm_cross and luckfox_sysroot != ''
-  _inc = include_directories(luckfox_sysroot + '/usr/include', is_system : true)
   _lib = luckfox_sysroot + '/usr/lib'
-
-  ncnn_dep    = declare_dependency(
-    include_directories : _inc,
-    dependencies        : cxx.find_library('ncnn',    dirs : [_lib], required : true))
-  sqlite3_dep = declare_dependency(
-    include_directories : _inc,
-    dependencies        : cxx.find_library('sqlite3', dirs : [_lib], required : true))
+  # Includes are already injected via -isystem in add_project_arguments above.
+  ncnn_dep    = cxx.find_library('ncnn',    dirs : [_lib], required : true)
+  sqlite3_dep = cxx.find_library('sqlite3', dirs : [_lib], required : true)
 else
   ncnn_dep    = dependency('ncnn',    required : true)
   sqlite3_dep = dependency('sqlite3', required : true)
