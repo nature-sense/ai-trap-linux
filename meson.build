@@ -129,7 +129,7 @@ endif
 if target_opt == 'v4l2' or target_opt == 'all'
   executable('yolo_v4l2',
     sources : shared_sources + files(
-      'firmware/src/io/src/v4l2_capture.cpp',
+      'firmware/src/io/v4l2_capture.cpp',
       'firmware/main_v4l2.cpp',
     ),
     include_directories : inc,
