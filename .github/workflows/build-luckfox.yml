@@ -187,38 +187,33 @@ jobs:
       # regardless of runner home directory.
 
       - name: Generate CI cross file
-        env:
-          BIN:     ${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}
-          SYSROOT: ${{ env.SYSROOT }}
         run: |
-          python3 - << 'PYEOF'
-          import os, pathlib
-          bin     = os.environ["BIN"]
-          sysroot = os.environ["SYSROOT"]
-          cross   = "arm-rockchip830-linux-uclibcgnueabihf"
-          content = f"""
-[binaries]
-c          = '{bin}-gcc'
-cpp        = '{bin}-g++'
-ar         = '{bin}-ar'
-strip      = '{bin}-strip'
-objcopy    = '{bin}-objcopy'
-pkg-config = '/usr/local/bin/{cross}-pkg-config'
-
-[host_machine]
-system     = 'linux'
-cpu_family = 'arm'
-cpu        = 'cortex-a7'
-endian     = 'little'
-
-[properties]
-sys_root          = '{sysroot}'
-pkg_config_libdir = '{sysroot}/usr/lib/pkgconfig:{sysroot}/usr/share/pkgconfig'
-cmake_prefix_path = ['{sysroot}/usr']
-""".lstrip()
-          pathlib.Path('cross/luckfox-rv1106-ci.ini').write_text(content)
-          print(content)
-          PYEOF
+          BIN="${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}"
+          SYSROOT="${{ env.SYSROOT }}"
+          PKGCONFIG="/usr/local/bin/${{ env.CROSS }}-pkg-config"
+          OUT="cross/luckfox-rv1106-ci.ini"
+          {
+            echo "[binaries]"
+            echo "c          = '${BIN}-gcc'"
+            echo "cpp        = '${BIN}-g++'"
+            echo "ar         = '${BIN}-ar'"
+            echo "strip      = '${BIN}-strip'"
+            echo "objcopy    = '${BIN}-objcopy'"
+            echo "pkg-config = '${PKGCONFIG}'"
+            echo ""
+            echo "[host_machine]"
+            echo "system     = 'linux'"
+            echo "cpu_family = 'arm'"
+            echo "cpu        = 'cortex-a7'"
+            echo "endian     = 'little'"
+            echo ""
+            echo "[properties]"
+            echo "sys_root          = '${SYSROOT}'"
+            echo "pkg_config_libdir = '${SYSROOT}/usr/lib/pkgconfig:${SYSROOT}/usr/share/pkgconfig'"
+            echo "cmake_prefix_path = ['${SYSROOT}/usr']"
+          } > "$OUT"
+          echo "=== Generated cross file ==="
+          cat "$OUT"
 
       # ── Meson configure + build ─────────────────────────────────────────────
 
