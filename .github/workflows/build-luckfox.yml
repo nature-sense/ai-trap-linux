@@ -1,0 +1,215 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  build-luckfox.yml
+#
+#  Cross-compiles yolo_v4l2 for the Luckfox Pico Zero (RV1106G3, Cortex-A7)
+#  on a standard ubuntu-22.04 GitHub-hosted runner.
+#
+#  Stages
+#  ──────
+#  1. Toolchain   — sparse-clone the Luckfox SDK, run env_install_toolchain.sh
+#                   Result cached by toolchain commit SHA so re-downloads only
+#                   when Luckfox push a new toolchain.
+#  2. Sysroot     — cross-build SQLite3 + NCNN and install into
+#                   sysroot/luckfox/  Result cached by dep versions so a
+#                   full dep rebuild is only triggered when versions change.
+#  3. App build   — meson + ninja, using a CI-generated cross file that
+#                   substitutes real workspace paths.
+#  4. Artifact    — stripped yolo_v4l2 binary uploaded for 30 days.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Build · Luckfox Pico Zero
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CROSS:          arm-rockchip830-linux-uclibcgnueabihf
+  TOOLCHAIN_DIR:  ${{ github.workspace }}/toolchain/arm-rockchip830-linux-uclibcgnueabihf
+  SYSROOT:        ${{ github.workspace }}/sysroot/luckfox
+  NCNN_VERSION:   20240410
+  SQLITE_VERSION: 3450100
+  SQLITE_YEAR:    2024
+  ARM_FLAGS:      -march=armv7-a -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -O2
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ── Host tools ──────────────────────────────────────────────────────────
+
+      - name: Install host build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build meson pkg-config \
+            curl ca-certificates git
+
+      # ── Toolchain ───────────────────────────────────────────────────────────
+      #
+      # Sparse-clone only the toolchain directory from the Luckfox SDK, then
+      # run env_install_toolchain.sh which downloads the actual compiler
+      # binaries.  Cache keyed on the SDK commit so we only re-download when
+      # Luckfox update the toolchain.
+
+      - name: Get Luckfox SDK HEAD commit
+        id: sdk-commit
+        run: |
+          SHA=$(git ls-remote https://github.com/LuckfoxTECH/luckfox-pico.git HEAD | cut -f1)
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TOOLCHAIN_DIR }}
+          key: luckfox-toolchain-${{ steps.sdk-commit.outputs.sha }}
+
+      - name: Download Luckfox toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/LuckfoxTECH/luckfox-pico.git luckfox-sdk
+          cd luckfox-sdk
+          git sparse-checkout set \
+            tools/linux/toolchain/${{ env.CROSS }}
+          # env_install_toolchain.sh may download additional blobs;
+          # run it if present, otherwise assume sparse-checkout was enough.
+          if [ -f env_install_toolchain.sh ]; then
+            bash env_install_toolchain.sh || true
+          fi
+          TOOLCHAIN_SRC=tools/linux/toolchain/${{ env.CROSS }}
+          if [ -d "$TOOLCHAIN_SRC" ]; then
+            mkdir -p "${{ env.TOOLCHAIN_DIR }}"
+            cp -a "$TOOLCHAIN_SRC"/. "${{ env.TOOLCHAIN_DIR }}/"
+          else
+            echo "ERROR: toolchain directory not found after SDK clone" >&2
+            ls tools/linux/toolchain/ || true
+            exit 1
+          fi
+          cd ..
+          rm -rf luckfox-sdk
+
+      - name: Verify toolchain
+        run: |
+          "${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}-gcc" --version
+
+      # ── Sysroot (SQLite3 + NCNN) ────────────────────────────────────────────
+
+      - name: Cache sysroot
+        id: cache-sysroot
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SYSROOT }}
+          key: luckfox-sysroot-sqlite${{ env.SQLITE_VERSION }}-ncnn${{ env.NCNN_VERSION }}-v1
+
+      - name: Cross-build SQLite3
+        if: steps.cache-sysroot.outputs.cache-hit != 'true'
+        run: |
+          GCC="${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}-gcc"
+          curl -fsSL \
+            https://www.sqlite.org/${{ env.SQLITE_YEAR }}/sqlite-autoconf-${{ env.SQLITE_VERSION }}.tar.gz \
+            | tar xz
+          cd sqlite-autoconf-${{ env.SQLITE_VERSION }}
+          ./configure \
+            --host=${{ env.CROSS }} \
+            --prefix=/usr \
+            --enable-static \
+            --disable-shared \
+            CC="$GCC" \
+            CFLAGS="${{ env.ARM_FLAGS }}"
+          make -j$(nproc)
+          make DESTDIR="${{ env.SYSROOT }}" install
+          cd ..
+          rm -rf sqlite-autoconf-${{ env.SQLITE_VERSION }}
+
+      - name: Cross-build NCNN
+        if: steps.cache-sysroot.outputs.cache-hit != 'true'
+        run: |
+          GCC="${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}-gcc"
+          GXX="${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}-g++"
+          git clone --depth 1 --branch ${{ env.NCNN_VERSION }} \
+            https://github.com/Tencent/ncnn.git ncnn-src
+          cmake -S ncnn-src -B ncnn-build \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=arm \
+            -DCMAKE_C_COMPILER="$GCC" \
+            -DCMAKE_CXX_COMPILER="$GXX" \
+            -DCMAKE_C_FLAGS="${{ env.ARM_FLAGS }}" \
+            -DCMAKE_CXX_FLAGS="${{ env.ARM_FLAGS }}" \
+            -DCMAKE_INSTALL_PREFIX="${{ env.SYSROOT }}/usr" \
+            -DNCNN_TARGET_ARCH=arm \
+            -DNCNN_SHARED_LIB=OFF \
+            -DNCNN_BUILD_TESTS=OFF \
+            -DNCNN_BUILD_EXAMPLES=OFF \
+            -DNCNN_BUILD_TOOLS=OFF \
+            -DNCNN_BUILD_BENCHMARK=OFF \
+            -DNCNN_VULKAN=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build ncnn-build -j$(nproc)
+          cmake --install ncnn-build
+          rm -rf ncnn-src ncnn-build
+
+      # ── Generate cross file with real CI paths ──────────────────────────────
+      #
+      # The checked-in cross/luckfox-rv1106.ini has paths for local dev.
+      # We generate a fresh one here so meson always gets the right paths
+      # regardless of runner home directory.
+
+      - name: Generate CI cross file
+        run: |
+          BIN="${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}"
+          cat > cross/luckfox-rv1106-ci.ini << EOF
+          [binaries]
+          c         = '${BIN}-gcc'
+          cpp       = '${BIN}-g++'
+          ar        = '${BIN}-ar'
+          strip     = '${BIN}-strip'
+          objcopy   = '${BIN}-objcopy'
+          pkg-config = 'pkg-config'
+
+          [host_machine]
+          system     = 'linux'
+          cpu_family = 'arm'
+          cpu        = 'cortex-a7'
+          endian     = 'little'
+
+          [properties]
+          sys_root          = '${{ env.SYSROOT }}'
+          pkg_config_libdir = '${{ env.SYSROOT }}/usr/lib/pkgconfig:${{ env.SYSROOT }}/usr/share/pkgconfig'
+          EOF
+
+      # ── Meson configure + build ─────────────────────────────────────────────
+
+      - name: Configure (meson)
+        run: |
+          meson setup build-luckfox \
+            --cross-file cross/luckfox-rv1106-ci.ini \
+            -Dtarget=v4l2 \
+            -Dluckfox_sysroot=${{ env.SYSROOT }} \
+            --buildtype=release
+
+      - name: Build (ninja)
+        run: ninja -C build-luckfox
+
+      # ── Strip + upload ───────────────────────────────────────────────────────
+
+      - name: Strip binary
+        run: |
+          "${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}-strip" \
+            build-luckfox/yolo_v4l2
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: yolo_v4l2-rv1106-${{ github.sha }}
+          path: build-luckfox/yolo_v4l2
+          retention-days: 30
