@@ -167,18 +167,23 @@ jobs:
 
       - name: Create pkg-config wrapper for target
         run: |
-          WRAPPER=/usr/local/bin/${{ env.CROSS }}-pkg-config
-          sudo tee "$WRAPPER" > /dev/null << 'SCRIPT'
-          #!/bin/sh
-          export PKG_CONFIG_DIR=
-          export PKG_CONFIG_LIBDIR=SYSROOT_PLACEHOLDER/usr/lib/pkgconfig:SYSROOT_PLACEHOLDER/usr/share/pkgconfig
-          export PKG_CONFIG_SYSROOT_DIR=SYSROOT_PLACEHOLDER
-          exec pkg-config "$@"
-          SCRIPT
-          sudo sed -i "s|SYSROOT_PLACEHOLDER|${{ env.SYSROOT }}|g" "$WRAPPER"
+          SYSROOT="${{ env.SYSROOT }}"
+          WRAPPER="/usr/local/bin/${{ env.CROSS }}-pkg-config"
+          REAL_PKG="$(which pkg-config)"
+          {
+            printf '#!/bin/sh\n'
+            printf 'export PKG_CONFIG_DIR=\n'
+            printf 'export PKG_CONFIG_LIBDIR="%s/usr/lib/pkgconfig:%s/usr/share/pkgconfig"\n' "$SYSROOT" "$SYSROOT"
+            printf 'export PKG_CONFIG_SYSROOT_DIR="%s"\n' "$SYSROOT"
+            printf 'exec "%s" "$@"\n' "$REAL_PKG"
+          } | sudo tee "$WRAPPER" > /dev/null
           sudo chmod +x "$WRAPPER"
-          # Smoke-test
+          echo "=== wrapper ==="
+          cat "$WRAPPER"
+          echo "=== smoke test ==="
           "$WRAPPER" --version
+          echo "=== pkgconfig dir ==="
+          ls "$SYSROOT/usr/lib/pkgconfig/" 2>/dev/null || echo "(not yet built — will be populated by sysroot steps)"
 
       # ── Generate cross file with real CI paths ──────────────────────────────
       #
@@ -218,6 +223,8 @@ jobs:
       # ── Meson configure + build ─────────────────────────────────────────────
 
       - name: Configure (meson)
+        env:
+          PKG_CONFIG_PATH: ${{ env.SYSROOT }}/usr/lib/pkgconfig:${{ env.SYSROOT }}/usr/share/pkgconfig
         run: |
           meson setup build-luckfox \
             --cross-file cross/luckfox-rv1106-ci.ini \
