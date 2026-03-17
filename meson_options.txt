@@ -8,7 +8,5 @@ option('target',
 option('luckfox_sysroot',
   type    : 'string',
   value   : '',
-  description : 'Path to sysroot containing cross-compiled NCNN and SQLite3 for the RV1106 target. '\
-                'Overrides sys_root in cross/luckfox-rv1106.ini. '\
-                'Leave empty to rely on the cross file or pkg-config from PATH.'
+  description : 'Path to sysroot with cross-compiled NCNN/SQLite3 for RV1106. Overrides sys_root in cross/luckfox-rv1106.ini. Leave empty to use the cross file defaults.'
 )
