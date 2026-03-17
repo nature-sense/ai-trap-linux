@@ -2,6 +2,9 @@
 build/
 build-*/
 
+# Cross-compilation sysroot (built by scripts/build-luckfox-deps.sh)
+sysroot/
+
 # Model weights — .param and .bin are small enough to commit.
 # .rknn files are larger compiled outputs — regenerate from .onnx.
 models/*.rknn
