@@ -158,33 +158,6 @@ jobs:
           cmake --install ncnn-build
           rm -rf ncnn-src ncnn-build
 
-      # ── pkg-config wrapper ──────────────────────────────────────────────────
-      #
-      # Meson looks for a pkg-config binary named after the cross tuple for
-      # machine 1 queries.  We create a thin wrapper that hard-wires
-      # PKG_CONFIG_LIBDIR to the sysroot so the real pkg-config finds our
-      # cross-built .pc files.
-
-      - name: Create pkg-config wrapper for target
-        run: |
-          SYSROOT="${{ env.SYSROOT }}"
-          WRAPPER="/usr/local/bin/${{ env.CROSS }}-pkg-config"
-          REAL_PKG="$(which pkg-config)"
-          {
-            printf '#!/bin/sh\n'
-            printf 'export PKG_CONFIG_DIR=\n'
-            printf 'export PKG_CONFIG_LIBDIR="%s/usr/lib/pkgconfig:%s/usr/share/pkgconfig"\n' "$SYSROOT" "$SYSROOT"
-            printf 'export PKG_CONFIG_SYSROOT_DIR="%s"\n' "$SYSROOT"
-            printf 'exec "%s" "$@"\n' "$REAL_PKG"
-          } | sudo tee "$WRAPPER" > /dev/null
-          sudo chmod +x "$WRAPPER"
-          echo "=== wrapper ==="
-          cat "$WRAPPER"
-          echo "=== smoke test ==="
-          "$WRAPPER" --version
-          echo "=== pkgconfig dir ==="
-          ls "$SYSROOT/usr/lib/pkgconfig/" 2>/dev/null || echo "(not yet built — will be populated by sysroot steps)"
-
       # ── Generate cross file with real CI paths ──────────────────────────────
       #
       # The checked-in cross/luckfox-rv1106.ini has paths for local dev.
@@ -204,7 +177,7 @@ jobs:
             echo "ar         = '${BIN}-ar'"
             echo "strip      = '${BIN}-strip'"
             echo "objcopy    = '${BIN}-objcopy'"
-            echo "pkg-config = '${PKGCONFIG}'"
+            echo "pkg-config = 'false'"
             echo ""
             echo "[host_machine]"
             echo "system     = 'linux'"
@@ -223,8 +196,6 @@ jobs:
       # ── Meson configure + build ─────────────────────────────────────────────
 
       - name: Configure (meson)
-        env:
-          PKG_CONFIG_PATH: ${{ env.SYSROOT }}/usr/lib/pkgconfig:${{ env.SYSROOT }}/usr/share/pkgconfig
         run: |
           meson setup build-luckfox \
             --cross-file cross/luckfox-rv1106-ci.ini \
