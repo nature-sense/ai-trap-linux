@@ -43,8 +43,11 @@ jobs:
             binutils-aarch64-linux-gnu \
             cmake ninja-build \
             curl ca-certificates python3-pip
-          # Install a recent meson via pip (apt ships 0.61 which is too old)
-          sudo pip3 install --quiet meson
+          # Install a recent meson via pip (apt ships 0.61 which has a bug
+          # generating sizeof(void*) probes in cross-compilation mode).
+          # Install to /usr/local/bin which takes precedence over /usr/bin.
+          sudo pip3 install --quiet 'meson>=1.3'
+          echo "meson: $(meson --version) at $(which meson)"
 
       # ── libcamera (aarch64 via Ubuntu multiarch) ───────────────────────────
       # GitHub Actions runners only have amd64 apt sources by default.
@@ -181,7 +184,7 @@ jobs:
       # ── Meson configure ────────────────────────────────────────────────────
       - name: Configure (meson)
         run: |
-          meson setup build-pi5 \
+          /usr/local/bin/meson setup build-pi5 \
             --cross-file cross/pi5-aarch64-ci.ini \
             -Dtarget=libcamera \
             -Dpi5_sysroot=${{ env.SYSROOT }} \
