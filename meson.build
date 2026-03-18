@@ -101,7 +101,13 @@ endif
 
 if meson.is_cross_build()
   add_project_link_arguments(
-    ['-static-libstdc++', '-static-libgcc'],
+    # Static C++ runtime — avoids toolchain version mismatch on target.
+    '-static-libstdc++', '-static-libgcc',
+    # libcamera.so's transitive deps (libpisp, libudev, libyaml, libdw, etc.)
+    # are not in the staging sysroot but will be present on the Pi at runtime.
+    # --allow-shlib-undefined suppresses linker errors for symbols that are
+    # only needed by a shared library we link against (not by our code directly).
+    '-Wl,--allow-shlib-undefined',
     language : 'cpp')
 endif
 
