@@ -45,47 +45,54 @@ jobs:
             curl ca-certificates python3-pip
           # Install a recent meson via pip (apt ships 0.61 which has a bug
           # generating sizeof(void*) probes in cross-compilation mode).
-          # Install to /usr/local/bin which takes precedence over /usr/bin.
           sudo pip3 install --quiet 'meson>=1.3'
-          echo "meson: $(meson --version) at $(which meson)"
+          echo "meson: $(/usr/local/bin/meson --version) at $(which meson)"
 
-      # ── libcamera (aarch64 via Ubuntu multiarch) ───────────────────────────
-      # GitHub Actions runners only have amd64 apt sources by default.
-      # arm64 packages live on ports.ubuntu.com, not security.ubuntu.com,
-      # so we pin the existing sources to [arch=amd64] then add a separate
-      # ports.ubuntu.com source for arm64 before enabling the architecture.
-      - name: Install libcamera (aarch64 multiarch)
+      # ── libcamera from Raspberry Pi OS ────────────────────────────────────
+      # Ubuntu 22.04 ships libcamera 0.0.4 which has incompatible headers
+      # (e.g. no framebuffer.h, double-nested include paths). We fetch the
+      # packages directly from the Pi OS Bookworm repo and extract them into
+      # the sysroot — no installation so no apt dependency conflicts.
+      - name: Fetch libcamera from Raspberry Pi OS into sysroot
         run: |
-          # Restrict existing sources to amd64 so apt update doesn't try to
-          # fetch arm64 from the amd64-only mirrors and fail with 404.
-          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          # Import Pi OS signing key
+          curl -fsSL https://archive.raspberrypi.com/debian/raspberrypi.gpg.key \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/raspberrypi-keyring.gpg > /dev/null
 
-          # Add arm64 sources pointing at ports.ubuntu.com
-          cat <<'EOF' | sudo tee /etc/apt/sources.list.d/arm64-ports.list
-          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
-          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
-          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
-          EOF
+          # Add Pi OS bookworm repo (arm64 only)
+          echo "deb [arch=arm64 signed-by=/usr/share/keyrings/raspberrypi-keyring.gpg] http://archive.raspberrypi.com/debian/ bookworm main" \
+            | sudo tee /etc/apt/sources.list.d/raspberrypi.list
+
+          # Also need base Debian Bookworm for libcamera's dependencies
+          echo "deb [arch=arm64] http://deb.debian.org/debian bookworm main" \
+            | sudo tee /etc/apt/sources.list.d/debian-bookworm-arm64.list
 
           sudo dpkg --add-architecture arm64
           sudo apt-get update -qq
-          sudo apt-get install -y \
-            libcamera-dev:arm64
 
-      # ── Diagnose libcamera install ────────────────────────────────────────
-      - name: Diagnose libcamera pkg-config location
-        run: |
-          echo "=== .pc files in aarch64 pkgconfig dir ==="
-          ls /usr/lib/aarch64-linux-gnu/pkgconfig/ | grep -i cam || echo "(none)"
-          echo "=== all libcamera .pc files on system ==="
-          find / -name "libcamera*.pc" 2>/dev/null || echo "(none)"
-          echo "=== libcamera files installed ==="
-          dpkg -L libcamera-dev:arm64 2>/dev/null | head -30
+          # Download .deb files only — do not install, to avoid pulling in
+          # arm64 runtime deps that conflict with the amd64 build environment.
+          mkdir -p ${{ env.SYSROOT }}
+          cd /tmp
+          apt-get download \
+            libcamera-dev:arm64 \
+            libcamera0.3:arm64 || apt-get download libcamera-dev:arm64 libcamera0:arm64
+          for deb in libcamera*.deb; do
+            dpkg-deb -x "$deb" ${{ env.SYSROOT }}
+          done
+
+          echo "=== libcamera libs in sysroot ==="
+          find ${{ env.SYSROOT }}/usr/lib -name "libcamera*" 2>/dev/null | head -10
+          echo "=== libcamera headers (framebuffer) ==="
+          find ${{ env.SYSROOT }}/usr/include -name "framebuffer.h" 2>/dev/null
+          echo "=== libcamera .pc files ==="
+          find ${{ env.SYSROOT }} -name "*.pc" | grep -i camera
 
       # ── pkg-config wrapper ─────────────────────────────────────────────────
-      # Meson's cross pkg-config must search both the multiarch system paths
-      # (for libcamera) and the staging sysroot (for NCNN + SQLite3).
-      # Use echo to avoid heredoc indentation issues in YAML block scalars.
+      # Points to the Pi OS libcamera .pc files extracted into the sysroot.
+      # PKG_CONFIG_SYSROOT_DIR rewrites absolute paths in .pc Cflags/Libs
+      # so they point into the sysroot rather than the host system.
       - name: Create aarch64 pkg-config wrapper
         run: |
           SYSROOT="${{ env.SYSROOT }}"
@@ -93,7 +100,8 @@ jobs:
           {
             echo '#!/bin/bash'
             echo 'export PKG_CONFIG_DIR='
-            echo "export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig:${SYSROOT}/usr/lib/pkgconfig"
+            echo "export PKG_CONFIG_SYSROOT_DIR=${SYSROOT}"
+            echo "export PKG_CONFIG_LIBDIR=${SYSROOT}/usr/lib/aarch64-linux-gnu/pkgconfig:${SYSROOT}/usr/lib/pkgconfig:/usr/share/pkgconfig"
             echo 'exec pkg-config "$@"'
           } | sudo tee "$WRAPPER" > /dev/null
           sudo chmod +x "$WRAPPER"
@@ -175,8 +183,8 @@ jobs:
             echo "endian     = 'little'"
             echo ""
             echo "[properties]"
-            echo "pkg_config_libdir = '/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig:${SYSROOT}/usr/lib/pkgconfig'"
-            echo "cmake_prefix_path = ['${SYSROOT}/usr', '/usr/lib/aarch64-linux-gnu']"
+            echo "pkg_config_libdir = '${SYSROOT}/usr/lib/aarch64-linux-gnu/pkgconfig:${SYSROOT}/usr/lib/pkgconfig:/usr/share/pkgconfig'"
+            echo "cmake_prefix_path = ['${SYSROOT}/usr']"
           } > "$OUT"
           echo "=== Generated cross file ==="
           cat "$OUT"
