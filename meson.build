@@ -132,11 +132,10 @@ if _cross_sysroot != ''
   ncnn_dep    = cxx.find_library('ncnn',    dirs : [_lib],             required : true)
   sqlite3_dep = cxx.find_library('sqlite3', dirs : [_lib],             required : true)
 
-  # libcamera is fetched from Raspberry Pi OS into the sysroot.
-  # Use find_library so meson picks up the .so directly without relying
-  # on pkg-config path rewriting for the include path (we already inject
-  # -isystem <sysroot>/usr/include above).
-  if is_aarch64_cross
+  # libcamera: if pkg-config already found it (e.g. via the sysroot
+  # pkg-config wrapper) keep that result.  Only fall back to find_library
+  # if pkg-config came up empty.
+  if is_aarch64_cross and not libcamera_dep.found()
     libcamera_dep = cxx.find_library('camera',
                       dirs     : [_lib_arch, _lib],
                       required : false)
