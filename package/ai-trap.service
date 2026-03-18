@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Wildlife Trap Detection Service
+Documentation=https://github.com/nature-sense/ai-trap-gstr
+After=network.target
+
+[Service]
+Type=simple
+User=ai-trap
+Group=video
+WorkingDirectory=/opt/ai-trap
+ExecStart=/opt/ai-trap/bin/yolo_libcamera /opt/ai-trap/trap_config.toml
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-trap
+
+# Allow the service to write crop images and the SQLite database
+ReadWritePaths=/opt/ai-trap
+
+[Install]
+WantedBy=multi-user.target

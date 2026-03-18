@@ -212,10 +212,46 @@ jobs:
       - name: Strip binary
         run: ${{ env.CROSS }}-strip build-pi5/yolo_libcamera
 
-      # ── Artifact ───────────────────────────────────────────────────────────
-      - name: Upload artifact
+      # ── Package ────────────────────────────────────────────────────────────
+      #
+      # Builds a self-contained installation tarball:
+      #   ai-trap-pi5-<sha>.tar.gz
+      #   ├── install.sh               — run as root to install
+      #   ├── bin/yolo_libcamera       — stripped aarch64 binary
+      #   ├── config/trap_config.toml  — default config (paths set for /opt/ai-trap)
+      #   └── systemd/ai-trap.service  — systemd unit file
+      #
+      - name: Build installation package
+        run: |
+          SHA="${{ github.sha }}"
+          SHORT="${SHA:0:7}"
+          PKG="ai-trap-pi5-${SHORT}"
+          mkdir -p "${PKG}/bin" "${PKG}/config" "${PKG}/systemd"
+
+          # Binary
+          cp build-pi5/yolo_libcamera "${PKG}/bin/"
+
+          # Config — rewrite model/db/crops paths for the installed location
+          sed \
+            -e 's|param.*=.*|param = "models/yolo11n-320/model.ncnn.param"|' \
+            -e 's|bin.*=.*".*model.*"|bin  = "models/yolo11n-320/model.ncnn.bin"|' \
+            -e 's|output_dir.*=.*|output_dir = "crops"|' \
+            -e 's|path.*=.*detections.db.*|path = "detections.db"|' \
+            trap_config.toml > "${PKG}/config/trap_config.toml"
+
+          # Systemd service and install script
+          cp package/ai-trap.service "${PKG}/systemd/"
+          cp package/install.sh      "${PKG}/"
+          chmod +x "${PKG}/install.sh"
+
+          tar -czf "${PKG}.tar.gz" "${PKG}/"
+          echo "PKG_FILE=${PKG}.tar.gz" >> "$GITHUB_ENV"
+          echo "=== Package contents ==="
+          tar -tzf "${PKG}.tar.gz"
+
+      - name: Upload installation package
         uses: actions/upload-artifact@v4
         with:
-          name: yolo_libcamera-pi5-aarch64
-          path: build-pi5/yolo_libcamera
+          name: ai-trap-pi5-${{ github.sha }}
+          path: ${{ env.PKG_FILE }}
           retention-days: 30
