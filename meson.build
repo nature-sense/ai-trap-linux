@@ -2,7 +2,7 @@
 #  meson.build — Insect Trap Pipeline
 #
 #  Source layout:
-#    src/              all C++ source and header files
+#    firmware/src/   all C++ source and header files
 #    trap_config.toml  runtime config (not compiled)
 #
 #  Build targets (set with -Dtarget=):
@@ -10,86 +10,116 @@
 #    v4l2          Luckfox Pico Zero + IMX415 via V4L2  → yolo_v4l2
 #    all           both (requires libcamera)
 #
-#  Native examples:
+#  Native build:
 #    meson setup build -Dtarget=libcamera && ninja -C build
 #    meson setup build -Dtarget=v4l2      && ninja -C build
 #
-#  Cross-compile for Luckfox Pico Zero (RV1106G3) on Ubuntu x86:
-#    source luckfox-pico/env_install_toolchain.sh
-#    meson setup build-luckfox \
-#      --cross-file cross/luckfox-rv1106.ini \
-#      -Dtarget=v4l2
-#    ninja -C build-luckfox
+#  Cross-compile for Raspberry Pi 5 (aarch64) on Ubuntu x86:
+#    sudo dpkg --add-architecture arm64
+#    sudo apt-get install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+#                         libcamera-dev:arm64
+#    # Build NCNN + SQLite3 into /opt/pi5-sysroot (see cross/pi5-aarch64.ini)
+#    meson setup build-pi5 \
+#      --cross-file cross/pi5-aarch64.ini \
+#      -Dtarget=libcamera \
+#      -Dpi5_sysroot=/opt/pi5-sysroot
+#    ninja -C build-pi5
 #
-#  Optional: override the sysroot that contains cross-compiled NCNN/SQLite3:
+#  Cross-compile for Luckfox Pico Zero (RV1106G3) on Ubuntu x86:
+#    # Install arm-rockchip830-linux-uclibcgnueabihf toolchain first
+#    # Build NCNN + SQLite3 into /opt/luckfox-sysroot (see cross/luckfox-rv1106.ini)
 #    meson setup build-luckfox \
 #      --cross-file cross/luckfox-rv1106.ini \
 #      -Dtarget=v4l2 \
-#      -Dluckfox_sysroot=/path/to/sysroot
+#      -Dluckfox_sysroot=/opt/luckfox-sysroot
+#    ninja -C build-luckfox
 # ─────────────────────────────────────────────────────────────────────────────
 
 project('yolo-trap', 'cpp',
   default_options : ['cpp_std=c++17', 'optimization=2'])
 
-# ── Cross-compilation: sysroot override ───────────────────────────────────────
-#
-# When building with --cross-file cross/luckfox-rv1106.ini the sysroot is
-# already set in [properties], but the user can override it here if the
-# cross-compiled deps live somewhere else.
+# ── Cross-compilation: target detection ───────────────────────────────────────
+
+is_arm_cross     = (meson.is_cross_build() and host_machine.cpu_family() == 'arm')
+is_aarch64_cross = (meson.is_cross_build() and host_machine.cpu_family() == 'aarch64')
 
 luckfox_sysroot = get_option('luckfox_sysroot')
+pi5_sysroot     = get_option('pi5_sysroot')
 
-is_arm_cross = (meson.is_cross_build() and
-                host_machine.cpu_family() == 'arm')
-
+# Resolve the active cross sysroot (empty string = not set)
+_cross_sysroot = ''
 if is_arm_cross and luckfox_sysroot != ''
-  # Redirect pkg-config to the user-supplied sysroot at configure time.
-  # (meson propagates this to the pkg-config invocations automatically when
-  # sys_root / pkg_config_libdir are set in the cross file; this block lets
-  # the user override those values without editing the cross file.)
-  message('Luckfox build: using sysroot ' + luckfox_sysroot)
+  _cross_sysroot = luckfox_sysroot
+  message('Luckfox (armv7) cross-build: sysroot = ' + luckfox_sysroot)
+elif is_aarch64_cross and pi5_sysroot != ''
+  _cross_sysroot = pi5_sysroot
+  message('Pi 5 (aarch64) cross-build: sysroot = ' + pi5_sysroot)
+endif
+
+if _cross_sysroot != ''
   add_project_arguments(
-    '-isystem' + luckfox_sysroot + '/usr/include',
+    '-isystem' + _cross_sysroot + '/usr/include',
     language : 'cpp')
   add_project_link_arguments(
-    '-L' + luckfox_sysroot + '/usr/lib',
+    '-L' + _cross_sysroot + '/usr/lib',
     language : 'cpp')
 endif
 
-# ── ARM Cortex-A7 / NEON compile flags ────────────────────────────────────────
+# ── CPU-specific compile flags ─────────────────────────────────────────────────
 #
-# Applied only when cross-compiling for the RV1106G3 target.
-# -mfpu=neon-vfpv4   enables NEON intrinsics used by NCNN's ARM kernels
-# -mfloat-abi=hard   matches the uClibC hard-float ABI of the toolchain
+#  armv7  (Luckfox RV1106G3 / Cortex-A7):
+#    -mfpu=neon-vfpv4  enables NEON intrinsics used by NCNN
+#    -mfloat-abi=hard  matches the uClibc hard-float ABI
+#
+#  aarch64 (Raspberry Pi 5 / Cortex-A76):
+#    +dotprod+fp16     enables NCNN ASIMD dot-product and FP16 kernels
 
-arm_flags = []
 if is_arm_cross
-  arm_flags = [
+  _cpu_flags = [
     '-march=armv7-a',
     '-mtune=cortex-a7',
     '-mfpu=neon-vfpv4',
     '-mfloat-abi=hard',
-    '-fomit-frame-pointer',  # saves a register on the single-core A7
+    '-fomit-frame-pointer',
   ]
-  add_project_arguments(arm_flags, language : 'cpp')
-  add_project_arguments(arm_flags, language : 'c')
+  add_project_arguments(_cpu_flags, language : 'cpp')
+  add_project_arguments(_cpu_flags, language : 'c')
+elif is_aarch64_cross
+  _cpu_flags = [
+    '-march=armv8.2-a+dotprod+fp16',
+    '-mtune=cortex-a76',
+  ]
+  add_project_arguments(_cpu_flags, language : 'cpp')
+  add_project_arguments(_cpu_flags, language : 'c')
+endif
+
+# ── Static C++ runtime for cross builds ───────────────────────────────────────
+#
+# Statically linking libstdc++ and libgcc_s produces a self-contained binary
+# that runs on the target without matching the exact host toolchain version.
+# glibc and libcamera remain dynamic (they are always present on the target OS).
+
+if meson.is_cross_build()
+  add_project_link_arguments(
+    ['-static-libstdc++', '-static-libgcc'],
+    language : 'cpp')
 endif
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 #
-# For ARM cross-builds the sysroot path is known, so we locate ncnn and
-# sqlite3 directly via find_library() rather than fighting pkg-config or
-# cmake discovery, which are unreliable in cross environments.
+# For cross-builds, NCNN and SQLite3 are located directly via find_library()
+# from the staging sysroot — more reliable than pkg-config or cmake discovery
+# in a cross environment.  libcamera is always discovered via pkg-config since
+# it is installed to the system multiarch path by apt.
 
 cxx = meson.get_compiler('cpp')
 
-thread_dep    = dependency('threads', required : true)
-omp_dep       = dependency('openmp',  required : false)
+thread_dep    = dependency('threads',   required : true)
+omp_dep       = dependency('openmp',    required : false)
 libcamera_dep = dependency('libcamera', required : false)
 
-if is_arm_cross and luckfox_sysroot != ''
-  _lib = luckfox_sysroot + '/usr/lib'
-  # Includes are already injected via -isystem in add_project_arguments above.
+if _cross_sysroot != ''
+  _lib = _cross_sysroot + '/usr/lib'
   ncnn_dep    = cxx.find_library('ncnn',    dirs : [_lib], required : true)
   sqlite3_dep = cxx.find_library('sqlite3', dirs : [_lib], required : true)
 else

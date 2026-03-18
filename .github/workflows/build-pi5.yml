@@ -1,0 +1,171 @@
+name: Build · Raspberry Pi 5 (aarch64)
+
+# Builds a self-contained yolo_libcamera binary for Raspberry Pi 5.
+#
+# What gets statically linked (no install needed on the Pi):
+#   NCNN (built from source, Cortex-A76 + dotprod + fp16 tuned)
+#   SQLite3 (built from source)
+#   libstdc++, libgcc_s
+#
+# What stays dynamic (always present on Raspberry Pi OS):
+#   libcamera  (system camera stack)
+#   glibc
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CROSS:          aarch64-linux-gnu
+  SYSROOT:        ${{ github.workspace }}/sysroot/pi5
+  NCNN_VERSION:   "20240410"
+  SQLITE_VERSION: "3450100"
+  SQLITE_YEAR:    "2024"
+
+jobs:
+  build-pi5:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Toolchain + build tools ────────────────────────────────────────────
+      - name: Install cross toolchain and build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            cmake ninja-build meson pkg-config \
+            curl ca-certificates
+
+      # ── libcamera (aarch64 via Ubuntu multiarch) ───────────────────────────
+      - name: Install libcamera (aarch64 multiarch)
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libcamera-dev:arm64 \
+            libgnutls28-dev:arm64
+
+      # ── pkg-config wrapper ─────────────────────────────────────────────────
+      # Meson's cross pkg-config must search both the multiarch system paths
+      # (for libcamera) and the staging sysroot (for NCNN + SQLite3).
+      - name: Create aarch64 pkg-config wrapper
+        run: |
+          SYSROOT="${{ env.SYSROOT }}"
+          sudo tee /usr/local/bin/${{ env.CROSS }}-pkg-config > /dev/null <<WRAPPER
+          #!/bin/bash
+          export PKG_CONFIG_DIR=
+          export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig:${SYSROOT}/usr/lib/pkgconfig
+          exec pkg-config "\$@"
+          WRAPPER
+          sudo chmod +x /usr/local/bin/${{ env.CROSS }}-pkg-config
+
+      # ── Sysroot cache (NCNN + SQLite3) ────────────────────────────────────
+      - name: Cache sysroot
+        id: cache-sysroot
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SYSROOT }}
+          key: pi5-sysroot-ncnn-${{ env.NCNN_VERSION }}-sqlite-${{ env.SQLITE_VERSION }}-v1
+
+      # ── SQLite3 ───────────────────────────────────────────────────────────
+      - name: Build SQLite3
+        if: steps.cache-sysroot.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ${{ env.SYSROOT }}
+          curl -fsSL "https://www.sqlite.org/${{ env.SQLITE_YEAR }}/sqlite-autoconf-${{ env.SQLITE_VERSION }}.tar.gz" | tar xz
+          cd sqlite-autoconf-${{ env.SQLITE_VERSION }}
+          ./configure \
+            --host=${{ env.CROSS }} \
+            --prefix=/usr \
+            --enable-static \
+            --disable-shared \
+            CC=${{ env.CROSS }}-gcc \
+            CFLAGS="-march=armv8.2-a -mtune=cortex-a76 -O2"
+          make -j$(nproc)
+          make DESTDIR=${{ env.SYSROOT }} install
+          cd .. && rm -rf sqlite-autoconf-${{ env.SQLITE_VERSION }}
+
+      # ── NCNN ──────────────────────────────────────────────────────────────
+      - name: Build NCNN
+        if: steps.cache-sysroot.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch ${{ env.NCNN_VERSION }} \
+            https://github.com/Tencent/ncnn.git ncnn-src
+          cmake -S ncnn-src -B ncnn-build \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=${{ env.CROSS }}-gcc \
+            -DCMAKE_CXX_COMPILER=${{ env.CROSS }}-g++ \
+            -DCMAKE_C_FLAGS="-march=armv8.2-a+dotprod+fp16 -mtune=cortex-a76 -O2" \
+            -DCMAKE_CXX_FLAGS="-march=armv8.2-a+dotprod+fp16 -mtune=cortex-a76 -O2" \
+            -DCMAKE_INSTALL_PREFIX=${{ env.SYSROOT }}/usr \
+            -DNCNN_TARGET_ARCH=aarch64 \
+            -DNCNN_BUILD_TESTS=OFF \
+            -DNCNN_BUILD_EXAMPLES=OFF \
+            -DNCNN_BUILD_TOOLS=OFF \
+            -DNCNN_VULKAN=OFF \
+            -DNCNN_SHARED_LIB=OFF \
+            -DNCNN_BUILD_BENCHMARK=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build ncnn-build -j$(nproc)
+          cmake --install ncnn-build
+          rm -rf ncnn-src ncnn-build
+
+      # ── Generate CI cross file ─────────────────────────────────────────────
+      - name: Generate CI cross file
+        run: |
+          BIN="/usr/bin/${{ env.CROSS }}"
+          SYSROOT="${{ env.SYSROOT }}"
+          PKGCONFIG="/usr/local/bin/${{ env.CROSS }}-pkg-config"
+          OUT="cross/pi5-aarch64-ci.ini"
+          {
+            echo "[binaries]"
+            echo "c          = '${BIN}-gcc'"
+            echo "cpp        = '${BIN}-g++'"
+            echo "ar         = '${BIN}-ar'"
+            echo "strip      = '${BIN}-strip'"
+            echo "objcopy    = '${BIN}-objcopy'"
+            echo "pkg-config = '${PKGCONFIG}'"
+            echo ""
+            echo "[host_machine]"
+            echo "system     = 'linux'"
+            echo "cpu_family = 'aarch64'"
+            echo "cpu        = 'cortex-a76'"
+            echo "endian     = 'little'"
+            echo ""
+            echo "[properties]"
+            echo "pkg_config_libdir = '/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig:${SYSROOT}/usr/lib/pkgconfig'"
+            echo "cmake_prefix_path = ['${SYSROOT}/usr', '/usr/lib/aarch64-linux-gnu']"
+          } > "$OUT"
+          echo "=== Generated cross file ==="
+          cat "$OUT"
+
+      # ── Meson configure ────────────────────────────────────────────────────
+      - name: Configure (meson)
+        run: |
+          meson setup build-pi5 \
+            --cross-file cross/pi5-aarch64-ci.ini \
+            -Dtarget=libcamera \
+            -Dpi5_sysroot=${{ env.SYSROOT }} \
+            --buildtype=release
+
+      # ── Build ──────────────────────────────────────────────────────────────
+      - name: Build (ninja)
+        run: ninja -C build-pi5
+
+      # ── Strip ──────────────────────────────────────────────────────────────
+      - name: Strip binary
+        run: ${{ env.CROSS }}-strip build-pi5/yolo_libcamera
+
+      # ── Artifact ───────────────────────────────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yolo_libcamera-pi5-aarch64
+          path: build-pi5/yolo_libcamera
+          retention-days: 30
