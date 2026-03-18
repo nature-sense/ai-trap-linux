@@ -116,7 +116,14 @@ cxx = meson.get_compiler('cpp')
 
 thread_dep    = dependency('threads',   required : true)
 omp_dep       = dependency('openmp',    required : false)
+# libcamera pkg-config name changed across versions:
+#   Ubuntu 22.04 (0.0.4)   → 'camera'
+#   Raspberry Pi OS / newer → 'libcamera'
+# Try the modern name first, fall back to the old one.
 libcamera_dep = dependency('libcamera', required : false)
+if not libcamera_dep.found()
+  libcamera_dep = dependency('camera', required : false)
+endif
 
 if _cross_sysroot != ''
   _lib = _cross_sysroot + '/usr/lib'
