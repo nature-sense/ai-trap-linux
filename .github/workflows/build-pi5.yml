@@ -69,6 +69,16 @@ jobs:
           sudo apt-get install -y \
             libcamera-dev:arm64
 
+      # ── Diagnose libcamera install ────────────────────────────────────────
+      - name: Diagnose libcamera pkg-config location
+        run: |
+          echo "=== .pc files in aarch64 pkgconfig dir ==="
+          ls /usr/lib/aarch64-linux-gnu/pkgconfig/ | grep -i cam || echo "(none)"
+          echo "=== all libcamera .pc files on system ==="
+          find / -name "libcamera*.pc" 2>/dev/null || echo "(none)"
+          echo "=== libcamera files installed ==="
+          dpkg -L libcamera-dev:arm64 2>/dev/null | head -30
+
       # ── pkg-config wrapper ─────────────────────────────────────────────────
       # Meson's cross pkg-config must search both the multiarch system paths
       # (for libcamera) and the staging sysroot (for NCNN + SQLite3).
