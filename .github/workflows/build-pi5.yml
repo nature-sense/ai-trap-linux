@@ -42,13 +42,27 @@ jobs:
             curl ca-certificates
 
       # ── libcamera (aarch64 via Ubuntu multiarch) ───────────────────────────
+      # GitHub Actions runners only have amd64 apt sources by default.
+      # arm64 packages live on ports.ubuntu.com, not security.ubuntu.com,
+      # so we pin the existing sources to [arch=amd64] then add a separate
+      # ports.ubuntu.com source for arm64 before enabling the architecture.
       - name: Install libcamera (aarch64 multiarch)
         run: |
+          # Restrict existing sources to amd64 so apt update doesn't try to
+          # fetch arm64 from the amd64-only mirrors and fail with 404.
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+
+          # Add arm64 sources pointing at ports.ubuntu.com
+          cat <<'EOF' | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
+          EOF
+
           sudo dpkg --add-architecture arm64
           sudo apt-get update -qq
           sudo apt-get install -y \
-            libcamera-dev:arm64 \
-            libgnutls28-dev:arm64
+            libcamera-dev:arm64
 
       # ── pkg-config wrapper ─────────────────────────────────────────────────
       # Meson's cross pkg-config must search both the multiarch system paths
