@@ -73,11 +73,17 @@ jobs:
 
           # Download .deb files only — do not install, to avoid pulling in
           # arm64 runtime deps that conflict with the amd64 build environment.
+          # Auto-detect the runtime package name from libcamera-dev's Depends field
+          # since Pi OS versions the lib package (libcamera0.3, libcamera0.5, etc.)
           mkdir -p ${{ env.SYSROOT }}
           cd /tmp
-          apt-get download \
-            libcamera-dev:arm64 \
-            libcamera0.3:arm64 || apt-get download libcamera-dev:arm64 libcamera0:arm64
+          apt-get download libcamera-dev:arm64
+          RUNTIME=$(apt-cache show libcamera-dev:arm64 2>/dev/null \
+            | grep '^Depends:' \
+            | grep -oP 'libcamera[0-9.]+' \
+            | head -1)
+          echo "Runtime package: ${RUNTIME}"
+          [ -n "${RUNTIME}" ] && apt-get download ${RUNTIME}:arm64
           for deb in libcamera*.deb; do
             dpkg-deb -x "$deb" ${{ env.SYSROOT }}
           done
