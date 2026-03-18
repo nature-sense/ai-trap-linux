@@ -64,10 +64,6 @@ jobs:
           echo "deb [arch=arm64 signed-by=/usr/share/keyrings/raspberrypi-keyring.gpg] http://archive.raspberrypi.com/debian/ bookworm main" \
             | sudo tee /etc/apt/sources.list.d/raspberrypi.list
 
-          # Also need base Debian Bookworm for libcamera's dependencies
-          echo "deb [arch=arm64] http://deb.debian.org/debian bookworm main" \
-            | sudo tee /etc/apt/sources.list.d/debian-bookworm-arm64.list
-
           sudo dpkg --add-architecture arm64
           sudo apt-get update -qq
 
