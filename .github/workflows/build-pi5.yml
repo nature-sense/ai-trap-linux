@@ -64,6 +64,10 @@ jobs:
           echo "deb [arch=arm64 signed-by=/usr/share/keyrings/raspberrypi-keyring.gpg] http://archive.raspberrypi.com/debian/ bookworm main" \
             | sudo tee /etc/apt/sources.list.d/raspberrypi.list
 
+          # Restrict existing Ubuntu sources to amd64 only — security.ubuntu.com
+          # does not host arm64 packages and returns 404 for them.
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+
           sudo dpkg --add-architecture arm64
           sudo apt-get update -qq
 
