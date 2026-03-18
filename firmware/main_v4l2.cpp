@@ -1,9 +1,9 @@
-#include "src/v4l2_capture.h"
-#include "src/decoder.h"
-#include "src/tracker.h"
-#include "src/persistence.h"
-#include "src/crop_saver.h"
-#include "src/mjpeg_streamer.h"
+#include "src/io/v4l2_capture.h"
+#include "src/pipeline/decoder.h"
+#include "src/pipeline/tracker.h"
+#include "src/pipeline/persistence.h"
+#include "src/pipeline/crop_saver.h"
+#include "src/server/mjpeg_streamer.h"
 #include "ncnn/net.h"
 
 #include <atomic>
