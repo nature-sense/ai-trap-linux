@@ -10,3 +10,9 @@ option('luckfox_sysroot',
   value   : '',
   description : 'Path to sysroot with cross-compiled NCNN/SQLite3 for RV1106. Overrides sys_root in cross/luckfox-rv1106.ini. Leave empty to use the cross file defaults.'
 )
+
+option('pi5_sysroot',
+  type    : 'string',
+  value   : '',
+  description : 'Path to sysroot containing BlueZ/libcamera headers for aarch64 cross-compilation. Leave empty when building natively on the Pi.'
+)

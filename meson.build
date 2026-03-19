@@ -38,21 +38,31 @@ project('yolo-trap', 'cpp',
 # cross-compiled deps live somewhere else.
 
 luckfox_sysroot = get_option('luckfox_sysroot')
+pi5_sysroot     = get_option('pi5_sysroot')
 
 is_arm_cross = (meson.is_cross_build() and
                 host_machine.cpu_family() == 'arm')
 
 if is_arm_cross and luckfox_sysroot != ''
-  # Redirect pkg-config to the user-supplied sysroot at configure time.
-  # (meson propagates this to the pkg-config invocations automatically when
-  # sys_root / pkg_config_libdir are set in the cross file; this block lets
-  # the user override those values without editing the cross file.)
   message('Luckfox build: using sysroot ' + luckfox_sysroot)
   add_project_arguments(
     '-isystem' + luckfox_sysroot + '/usr/include',
     language : 'cpp')
   add_project_link_arguments(
     '-L' + luckfox_sysroot + '/usr/lib',
+    language : 'cpp')
+endif
+
+# Pi 5 cross-compilation: inject sysroot headers (BlueZ, libcamera, etc.)
+# The sysroot is populated by the CI workflow (build-pi5.yml).
+if pi5_sysroot != ''
+  message('Pi 5 build: using sysroot ' + pi5_sysroot)
+  add_project_arguments(
+    '-isystem' + pi5_sysroot + '/usr/include',
+    language : 'cpp')
+  add_project_link_arguments(
+    '-L' + pi5_sysroot + '/usr/lib/aarch64-linux-gnu',
+    '-L' + pi5_sysroot + '/usr/lib',
     language : 'cpp')
 endif
 
@@ -83,11 +93,11 @@ thread_dep    = dependency('threads', required : true)
 omp_dep       = dependency('openmp',  required : false)
 libcamera_dep = dependency('libcamera', required : false)
 
-# libbluetooth — required for BLE GATT server on Pi 5 and Luckfox
-# Install: sudo apt install libbluetooth-dev   (Pi OS / Ubuntu)
-#          Buildroot: BR2_PACKAGE_BLUEZ5_UTILS must be enabled
+# Bluetooth headers — needed for BLE GATT server (Pi 5 and Luckfox).
+# We use only macros/inline functions from these headers; no libbluetooth.so or
+# libbluetooth.a is linked, so there is zero runtime dependency on BlueZ packages.
+# Headers come from the sysroot (see pi5_sysroot / luckfox_sysroot options).
 cc = meson.get_compiler('cpp')
-libbluetooth_dep = cc.find_library('bluetooth', required : true)
 
 # ── Option: select build target ───────────────────────────────────────────────
 
@@ -110,7 +120,7 @@ shared_sources = files(
   'firmware/src/common/ble_gatt_server.cpp',
 )
 
-shared_deps = [ncnn_dep, sqlite3_dep, thread_dep, omp_dep, libbluetooth_dep]
+shared_deps = [ncnn_dep, sqlite3_dep, thread_dep, omp_dep]
 
 inc = include_directories([
                             'firmware/src/common',

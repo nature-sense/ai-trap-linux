@@ -293,8 +293,11 @@ void BleGattServer::serverLoop() {
             break;
         }
 
+        // Format bdaddr_t without calling ba2str() to avoid libbluetooth runtime dep
+        const uint8_t* b = peer.l2_bdaddr.b;
         char addr[18];
-        ba2str(&peer.l2_bdaddr, addr);
+        snprintf(addr, sizeof(addr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 b[5], b[4], b[3], b[2], b[1], b[0]);
         printf("[ble] BLE client connected: %s\n", addr);
 
         {
