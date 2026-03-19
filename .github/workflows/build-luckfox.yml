@@ -103,9 +103,20 @@ jobs:
         run: |
           "${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}-gcc" --version
 
+      # ── Sysroot (SQLite3 + NCNN) ────────────────────────────────────────────
+
+      - name: Cache sysroot
+        id: cache-sysroot
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SYSROOT }}
+          key: luckfox-sysroot-sqlite${{ env.SQLITE_VERSION }}-ncnn${{ env.NCNN_VERSION }}-v1
+
       # ── BlueZ headers ───────────────────────────────────────────────────────
-      # Only header macros/inlines are used — no libbluetooth linkage at runtime.
-      # Headers are architecture-independent; extract from the BlueZ source tarball.
+      # Extracted AFTER cache restore so headers are always present whether the
+      # sysroot was restored from cache or freshly built.  They are not cached
+      # themselves — the tarball is tiny and the download is fast.
+      # Only header macros/inlines are used; no libbluetooth linkage at runtime.
 
       - name: Extract BlueZ headers into sysroot
         run: |
@@ -117,15 +128,6 @@ jobs:
                      "bluez-${{ env.BLUEZ_VERSION }}/lib/*.h"
           echo "=== BlueZ headers installed ==="
           ls ${{ env.SYSROOT }}/usr/include/bluetooth/
-
-      # ── Sysroot (SQLite3 + NCNN) ────────────────────────────────────────────
-
-      - name: Cache sysroot
-        id: cache-sysroot
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.SYSROOT }}
-          key: luckfox-sysroot-sqlite${{ env.SQLITE_VERSION }}-ncnn${{ env.NCNN_VERSION }}-bluez${{ env.BLUEZ_VERSION }}-v1
 
       - name: Cross-build SQLite3
         if: steps.cache-sysroot.outputs.cache-hit != 'true'
