@@ -77,11 +77,17 @@ endif
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 
-ncnn_dep    = dependency('ncnn',    required : true)
-sqlite3_dep = dependency('sqlite3', required : true)
-thread_dep  = dependency('threads', required : true)
-omp_dep     = dependency('openmp',  required : false)
+ncnn_dep      = dependency('ncnn',    required : true)
+sqlite3_dep   = dependency('sqlite3', required : true)
+thread_dep    = dependency('threads', required : true)
+omp_dep       = dependency('openmp',  required : false)
 libcamera_dep = dependency('libcamera', required : false)
+
+# libbluetooth — required for BLE GATT server on Pi 5 and Luckfox
+# Install: sudo apt install libbluetooth-dev   (Pi OS / Ubuntu)
+#          Buildroot: BR2_PACKAGE_BLUEZ5_UTILS must be enabled
+cc = meson.get_compiler('cpp')
+libbluetooth_dep = cc.find_library('bluetooth', required : true)
 
 # ── Option: select build target ───────────────────────────────────────────────
 
@@ -101,10 +107,10 @@ shared_sources = files(
   'firmware/src/server/http_server.cpp',
   'firmware/src/common/stb_image_write_impl.cpp',
   'firmware/src/common/wifi_manager.cpp',
-  'firmware/src/common/ble_ctrl.cpp',
+  'firmware/src/common/ble_gatt_server.cpp',
 )
 
-shared_deps = [ncnn_dep, sqlite3_dep, thread_dep, omp_dep,]
+shared_deps = [ncnn_dep, sqlite3_dep, thread_dep, omp_dep, libbluetooth_dep]
 
 inc = include_directories([
                             'firmware/src/common',

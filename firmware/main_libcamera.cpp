@@ -10,7 +10,7 @@
 #include "trap_events.h"
 #include "config_loader.h"
 #include "wifi_manager.h"
-#include "ble_ctrl.h"
+#include "ble_gatt_server.h"
 #include "ncnn/net.h"
 
 #include <atomic>
@@ -261,18 +261,19 @@ int main(int argc, char* argv[]) {
     wifi.applyStartupMode();
     http.setWifiManager(&wifi);
 
-    // ── BLE GATT bridge ───────────────────────────────────────────────────────
-    // BleCtrl listens on a Unix socket; ble_gatt.py connects to it and
-    // exposes the WiFi state/command GATT service via BlueZ D-Bus.
-    // Push a state update whenever WiFi changes so BLE clients stay in sync.
-    BleCtrl ble;
+    // ── BLE GATT server ───────────────────────────────────────────────────────
+    // Pure C++ — no Python, no D-Bus. Uses raw HCI + L2CAP ATT sockets.
+    // Note: bluetoothd must be stopped on Pi 5 (done by install.sh):
+    //   sudo systemctl disable --now bluetooth
+    BleGattServer ble;
     {
-        BleCtrlConfig bleCfg;
-        bleCfg.socketPath = "/tmp/ai-trap-ble.sock";
+        BleGattConfig bleCfg;
+        bleCfg.name   = "AI-Trap-" + cfg.trapId;
+        bleCfg.hciDev = 0;
         ble.open(bleCfg, &wifi);
     }
-    // When the inactivity timer fires, notify any connected BLE client
-    wifi.setInactiveCallback([&]() { ble.pushState(); });
+    // Notify BLE client whenever WiFi state changes (inactivity shutdown etc.)
+    wifi.setInactiveCallback([&]() { ble.notifyStateChanged(); });
 
     try {
         http.open(cfg.http, &db, &sse, &sync, &currentFps, &g_capturing);
