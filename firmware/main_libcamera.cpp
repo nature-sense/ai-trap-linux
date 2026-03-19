@@ -10,6 +10,7 @@
 #include "trap_events.h"
 #include "config_loader.h"
 #include "wifi_manager.h"
+#include "ble_gatt_server.h"
 #include "ncnn/net.h"
 
 #include <atomic>
@@ -259,6 +260,20 @@ int main(int argc, char* argv[]) {
     WifiManager wifi(cfg.trapId, cfg.wifi);
     wifi.applyStartupMode();
     http.setWifiManager(&wifi);
+
+    // ── BLE GATT server ───────────────────────────────────────────────────────
+    // Pure C++ — no Python, no D-Bus. Uses raw HCI + L2CAP ATT sockets.
+    // Note: bluetoothd must be stopped on Pi 5 (done by install.sh):
+    //   sudo systemctl disable --now bluetooth
+    BleGattServer ble;
+    {
+        BleGattConfig bleCfg;
+        bleCfg.name   = "AI-Trap-" + cfg.trapId;
+        bleCfg.hciDev = 0;
+        ble.open(bleCfg, &wifi);
+    }
+    // Notify BLE client whenever WiFi state changes (inactivity shutdown etc.)
+    wifi.setInactiveCallback([&]() { ble.notifyStateChanged(); });
 
     try {
         http.open(cfg.http, &db, &sse, &sync, &currentFps, &g_capturing);

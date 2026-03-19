@@ -151,6 +151,12 @@ else
   sqlite3_dep = dependency('sqlite3', required : true)
 endif
 
+# Bluetooth headers — needed for BLE GATT server (Pi 5 and Luckfox).
+# We use only macros/inline functions from these headers; no libbluetooth.so or
+# libbluetooth.a is linked, so there is zero runtime dependency on BlueZ packages.
+# Headers come from the sysroot (see pi5_sysroot / luckfox_sysroot options).
+cc = meson.get_compiler('cpp')
+
 # ── Option: select build target ───────────────────────────────────────────────
 
 target_opt = get_option('target')   # 'libcamera' | 'v4l2' | 'all'
@@ -169,9 +175,10 @@ shared_sources = files(
   'firmware/src/server/http_server.cpp',
   'firmware/src/common/stb_image_write_impl.cpp',
   'firmware/src/common/wifi_manager.cpp',
+  'firmware/src/common/ble_gatt_server.cpp',
 )
 
-shared_deps = [ncnn_dep, sqlite3_dep, thread_dep, omp_dep,]
+shared_deps = [ncnn_dep, sqlite3_dep, thread_dep, omp_dep]
 
 inc = include_directories([
                             'firmware/src/common',
