@@ -135,7 +135,7 @@ void BleGattServer::open(const BleGattConfig& cfg, WifiManager* wifi) {
     l2Addr.l2_family      = AF_BLUETOOTH;
     l2Addr.l2_cid         = htobs(ATT_CID);
     l2Addr.l2_bdaddr_type = BDADDR_LE_PUBLIC;
-    bacpy(&l2Addr.l2_bdaddr, BDADDR_ANY);
+    memset(&l2Addr.l2_bdaddr, 0, sizeof(bdaddr_t));  // BDADDR_ANY — avoids C++ rvalue issue
 
     // Allow re-bind after crash
     int one = 1;
@@ -227,7 +227,7 @@ bool BleGattServer::setupAdvertising() {
     advParams.chan_map         = 0x07;           // channels 37, 38, 39
     advParams.filter           = 0x00;           // allow all
 
-    if (!hciCmd(OGF_LE_CTL, OCF_LE_SET_ADV_PARAMETERS,
+    if (!hciCmd(OGF_LE_CTL, OCF_LE_SET_ADVERTISING_PARAMETERS,
                 reinterpret_cast<const uint8_t*>(&advParams), sizeof(advParams)))
         return false;
 
@@ -262,7 +262,7 @@ bool BleGattServer::setupAdvertising() {
 
     advData.length = len;
 
-    if (!hciCmd(OGF_LE_CTL, OCF_LE_SET_ADV_DATA,
+    if (!hciCmd(OGF_LE_CTL, OCF_LE_SET_ADVERTISING_DATA,
                 reinterpret_cast<const uint8_t*>(&advData), sizeof(advData)))
         return false;
 
