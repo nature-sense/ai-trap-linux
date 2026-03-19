@@ -77,6 +77,16 @@ else
         "${INSTALL_DIR}/${CONFIG_NAME}"
 fi
 
+# ── Disable system Bluetooth daemon ──────────────────────────────────────────
+# The AI Trap binary manages the BLE adapter directly using raw HCI and L2CAP
+# sockets. bluetoothd conflicts with this and must not be running.
+# This has no effect on camera, WiFi, or any other trap functionality.
+
+info "Disabling system Bluetooth daemon (bluetoothd)..."
+systemctl disable --now bluetooth.service 2>/dev/null || true
+# Also mask so it can't be accidentally started by another unit
+systemctl mask bluetooth.service 2>/dev/null || true
+
 # ── Install systemd service ───────────────────────────────────────────────────
 
 info "Installing systemd service..."
@@ -123,3 +133,4 @@ info "Crops:   ${INSTALL_DIR}/crops/"
 info "DB:      ${INSTALL_DIR}/detections.db"
 info "API:     http://<pi-ip>:8080"
 info "Stream:  http://<pi-ip>:9000"
+info "BLE:     advertises as 'AI-Trap-<trap_id>' (bluetoothd disabled)"

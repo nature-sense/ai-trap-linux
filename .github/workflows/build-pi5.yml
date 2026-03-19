@@ -23,6 +23,7 @@ env:
   NCNN_VERSION:   "20240410"
   SQLITE_VERSION: "3450100"
   SQLITE_YEAR:    "2024"
+  BLUEZ_VERSION:  "5.66"
 
 jobs:
   build-pi5:
@@ -114,13 +115,29 @@ jobs:
           echo "=== pkg-config wrapper ==="
           cat "$WRAPPER"
 
+      # ── BlueZ headers ──────────────────────────────────────────────────────
+      # We use only macros and inline functions from the Bluetooth headers —
+      # no libbluetooth.so or libbluetooth.a is linked, so there is no runtime
+      # dependency on any BlueZ package on the Pi.
+      # We extract just the headers from the BlueZ source tarball.
+      - name: Extract BlueZ headers into sysroot
+        run: |
+          mkdir -p ${{ env.SYSROOT }}/usr/include/bluetooth
+          curl -fsSL "https://www.kernel.org/pub/linux/bluetooth/bluez-${{ env.BLUEZ_VERSION }}.tar.xz" \
+            | tar xJ --strip-components=2 \
+                     --wildcards \
+                     -C ${{ env.SYSROOT }}/usr/include/bluetooth \
+                     "bluez-${{ env.BLUEZ_VERSION }}/lib/*.h"
+          echo "=== BlueZ headers installed ==="
+          ls ${{ env.SYSROOT }}/usr/include/bluetooth/
+
       # ── Sysroot cache (NCNN + SQLite3) ────────────────────────────────────
       - name: Cache sysroot
         id: cache-sysroot
         uses: actions/cache@v4
         with:
           path: ${{ env.SYSROOT }}
-          key: pi5-sysroot-ncnn-${{ env.NCNN_VERSION }}-sqlite-${{ env.SQLITE_VERSION }}-v1
+          key: pi5-sysroot-ncnn-${{ env.NCNN_VERSION }}-sqlite-${{ env.SQLITE_VERSION }}-bluez-${{ env.BLUEZ_VERSION }}-v1
 
       # ── SQLite3 ───────────────────────────────────────────────────────────
       - name: Build SQLite3
