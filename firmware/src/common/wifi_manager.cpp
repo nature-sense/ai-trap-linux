@@ -15,9 +15,52 @@
 WifiManager::WifiManager(const std::string& trapId, const WifiConfig& cfg)
     : m_trapId(trapId), m_cfg(cfg)
 {
-    // Build AP SSID: "ai-trap-<trapId>", capped at 32 chars (802.11 limit)
     std::string candidate = "ai-trap-" + trapId;
     m_apSsid = candidate.substr(0, 32);
+
+    if (m_cfg.inactivitySeconds > 0) {
+        markActivity();   // seed timer so it doesn't fire immediately
+        m_timerRunning = true;
+        m_timerThread  = std::thread(&WifiManager::timerLoop, this);
+    }
+}
+
+WifiManager::~WifiManager() {
+    m_timerRunning = false;
+    if (m_timerThread.joinable()) m_timerThread.join();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Inactivity timer
+// ─────────────────────────────────────────────────────────────────────────────
+
+void WifiManager::markActivity() {
+    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    m_lastActivity.store(now, std::memory_order_relaxed);
+}
+
+void WifiManager::timerLoop() {
+    while (m_timerRunning.load()) {
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        if (!m_timerRunning.load()) break;
+
+        auto lastRaw = m_lastActivity.load(std::memory_order_relaxed);
+        auto last    = std::chrono::steady_clock::time_point(
+                           std::chrono::steady_clock::duration(lastRaw));
+        auto elapsed = std::chrono::steady_clock::now() - last;
+        auto elapsedSec = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+
+        if (elapsedSec >= m_cfg.inactivitySeconds) {
+            WifiStatus st = getStatus();
+            if (st.mode != "off" && st.mode != "unknown") {
+                printf("[wifi] inactivity timeout (%llds) — shutting down WiFi\n",
+                       (long long)elapsedSec);
+                shutdownImpl();
+                markActivity();   // reset so we don't fire again immediately
+                if (m_inactiveCb) m_inactiveCb();
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -108,6 +151,12 @@ std::string WifiManager::resetToAP() {
     if (!err.empty()) return err;
     printf("[wifi] switched to AP mode, SSID=%s\n", m_apSsid.c_str());
     return {};
+}
+
+std::string WifiManager::shutdown() {
+    std::string err = shutdownImpl();
+    if (err.empty()) printf("[wifi] WiFi shut down\n");
+    return err;
 }
 
 void WifiManager::applyStartupMode() {
@@ -231,6 +280,14 @@ std::string WifiManager::switchToStation(const std::string& ssid,
         out.find("successfully") == std::string::npos) {
         return "nmcli connect failed: " + out;
     }
+    return {};
+}
+
+std::string WifiManager::shutdownImpl() const {
+    run(std::string("nmcli connection down ") + NM_AP_CON + " 2>/dev/null");
+    run(std::string("nmcli connection delete ") + NM_AP_CON + " 2>/dev/null");
+    run("nmcli device disconnect " + m_cfg.iface + " 2>/dev/null");
+    run("nmcli radio wifi off 2>/dev/null");
     return {};
 }
 
@@ -388,6 +445,12 @@ std::string WifiManager::switchToStation(const std::string& ssid,
     return {};
 }
 
+std::string WifiManager::shutdownImpl() const {
+    run("killall hostapd dnsmasq wpa_supplicant udhcpc 2>/dev/null");
+    run("ip link set " + m_cfg.iface + " down");
+    return {};
+}
+
 // =============================================================================
 //  BACKEND: stub (no WiFi management compiled in)
 // =============================================================================
@@ -407,5 +470,7 @@ std::string WifiManager::switchToAP() const {
 std::string WifiManager::switchToStation(const std::string&, const std::string&) const {
     return "no wifi backend compiled";
 }
+
+std::string WifiManager::shutdownImpl() const { return {}; }
 
 #endif  // WIFI_BACKEND_*

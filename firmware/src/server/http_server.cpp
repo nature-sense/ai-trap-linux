@@ -293,6 +293,9 @@ void HttpServer::handleClient(int fd) {
 
     m_requests.fetch_add(1, std::memory_order_relaxed);
 
+    // Reset WiFi inactivity timer on every request
+    if (m_wifi) m_wifi->markActivity();
+
     if (req.method == "OPTIONS") { sendCors(fd); return; }
     if (req.method == "GET")     { routeGet(fd, req);  return; }
     if (req.method == "POST")    { routePost(fd, req);   return; }
