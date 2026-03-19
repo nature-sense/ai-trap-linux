@@ -1,0 +1,182 @@
+# .github/workflows/cmake-multi-platform.yml
+name: Build Luckfox (RV1106 V4L2)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Toolchain ──────────────────────────────────────────────────────────
+      # Luckfox SDK toolchain: arm-rockchip830-linux-uclibcgnueabihf
+      # Fetched via sparse checkout to avoid downloading the entire SDK.
+
+      - name: Cache Luckfox toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: luckfox-toolchain
+          key: luckfox-toolchain-rv1106-v1
+
+      - name: Download Luckfox toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse \
+            https://github.com/LuckfoxTECH/luckfox-pico.git luckfox-sdk
+          cd luckfox-sdk
+          git sparse-checkout set tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf
+          cp -r tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf \
+            ../luckfox-toolchain/
+          cd ..
+          rm -rf luckfox-sdk
+
+      - name: Add toolchain to PATH
+        run: |
+          echo "$GITHUB_WORKSPACE/luckfox-toolchain/bin" >> $GITHUB_PATH
+
+      # ── Host build tools ──────────────────────────────────────────────────
+
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3-pip
+          pip3 install 'meson>=1.3'
+
+      # ── Sysroot (cross-compiled NCNN + SQLite3) ────────────────────────────
+
+      - name: Cache cross sysroot
+        id: cache-sysroot
+        uses: actions/cache@v4
+        with:
+          path: sysroot
+          key: luckfox-sysroot-ncnn-sqlite3-v3
+
+      - name: Build SQLite3 (cross)
+        if: steps.cache-sysroot.outputs.cache-hit != 'true'
+        run: |
+          TOOLCHAIN=$GITHUB_WORKSPACE/luckfox-toolchain/bin
+          CC=$TOOLCHAIN/arm-rockchip830-linux-uclibcgnueabihf-gcc
+          SYSROOT=$GITHUB_WORKSPACE/sysroot
+          mkdir -p "$SYSROOT/usr/include" "$SYSROOT/usr/lib"
+
+          wget -q https://www.sqlite.org/2024/sqlite-autoconf-3450200.tar.gz
+          tar xf sqlite-autoconf-3450200.tar.gz
+          cd sqlite-autoconf-3450200
+          CC="$CC" \
+          CFLAGS="-march=armv7-a -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -O2" \
+          ./configure --host=arm-linux --prefix="$SYSROOT/usr" \
+            --disable-shared --enable-static --disable-dynamic-extensions
+          make -j$(nproc)
+          make install
+          cd ..
+
+      - name: Generate CMake toolchain file
+        if: steps.cache-sysroot.outputs.cache-hit != 'true'
+        run: |
+          TOOLCHAIN=$GITHUB_WORKSPACE/luckfox-toolchain/bin
+          TC=$TOOLCHAIN/arm-rockchip830-linux-uclibcgnueabihf
+          mkdir -p cross
+          echo "set(CMAKE_SYSTEM_NAME      Linux)"                                    > cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_SYSTEM_PROCESSOR arm)"                                     >> cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_C_COMPILER    \"${TC}-gcc\")"                              >> cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_CXX_COMPILER  \"${TC}-g++\")"                              >> cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_AR            \"${TC}-ar\"   CACHE FILEPATH \"\")"         >> cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_STRIP         \"${TC}-strip\" CACHE FILEPATH \"\")"        >> cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_OBJCOPY       \"${TC}-objcopy\" CACHE FILEPATH \"\")"      >> cross/luckfox-rv1106-ci.cmake
+          echo "set(_ARM_FLAGS \"-march=armv7-a -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -fomit-frame-pointer\")" >> cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_C_FLAGS_INIT   \"\${_ARM_FLAGS}\")"                        >> cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_CXX_FLAGS_INIT \"\${_ARM_FLAGS}\")"                        >> cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)"                        >> cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)"                         >> cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)"                         >> cross/luckfox-rv1106-ci.cmake
+          echo "set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)"                         >> cross/luckfox-rv1106-ci.cmake
+
+      - name: Build NCNN (cross)
+        if: steps.cache-sysroot.outputs.cache-hit != 'true'
+        run: |
+          TOOLCHAIN=$GITHUB_WORKSPACE/luckfox-toolchain/bin
+          SYSROOT=$GITHUB_WORKSPACE/sysroot
+          git clone --depth=1 https://github.com/Tencent/ncnn.git
+          cmake -S ncnn -B ncnn-build \
+            -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/cross/luckfox-rv1106-ci.cmake \
+            -DCMAKE_INSTALL_PREFIX="$SYSROOT/usr" \
+            -DNCNN_BUILD_TESTS=OFF \
+            -DNCNN_BUILD_TOOLS=OFF \
+            -DNCNN_BUILD_EXAMPLES=OFF \
+            -DNCNN_VULKAN=OFF \
+            -DNCNN_SHARED_LIB=OFF \
+            -DNCNN_ENABLE_LTO=OFF \
+            -DNCNN_BUILD_BENCHMARK=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G Ninja
+          ninja -C ncnn-build install
+
+      # ── pkg-config wrapper ────────────────────────────────────────────────
+      # Meson needs a cross pkg-config that searches the sysroot lib dirs.
+
+      - name: Create cross pkg-config wrapper
+        run: |
+          SYSROOT=$GITHUB_WORKSPACE/sysroot
+          sudo tee /usr/local/bin/arm-rockchip830-linux-uclibcgnueabihf-pkg-config > /dev/null << 'WRAPPER'
+          #!/bin/sh
+          export PKG_CONFIG_LIBDIR="SYSROOT_PLACEHOLDER/usr/lib/pkgconfig:SYSROOT_PLACEHOLDER/usr/share/pkgconfig"
+          export PKG_CONFIG_SYSROOT_DIR="SYSROOT_PLACEHOLDER"
+          exec pkg-config "$@"
+          WRAPPER
+          # Substitute the actual sysroot path (can't use $VAR inside single-quoted heredoc)
+          sudo sed -i "s|SYSROOT_PLACEHOLDER|$SYSROOT|g" \
+            /usr/local/bin/arm-rockchip830-linux-uclibcgnueabihf-pkg-config
+          sudo chmod +x /usr/local/bin/arm-rockchip830-linux-uclibcgnueabihf-pkg-config
+
+      # ── Meson cross file ─────────────────────────────────────────────────
+      # Generated here so absolute paths match this runner's workspace.
+      # Written with echo to avoid YAML heredoc indentation issues.
+
+      - name: Generate Meson cross file
+        run: |
+          TOOLCHAIN=$GITHUB_WORKSPACE/luckfox-toolchain/bin
+          SYSROOT=$GITHUB_WORKSPACE/sysroot
+          mkdir -p cross
+          echo "[binaries]" > cross/luckfox-rv1106-ci.ini
+          echo "c       = '$TOOLCHAIN/arm-rockchip830-linux-uclibcgnueabihf-gcc'" >> cross/luckfox-rv1106-ci.ini
+          echo "cpp     = '$TOOLCHAIN/arm-rockchip830-linux-uclibcgnueabihf-g++'" >> cross/luckfox-rv1106-ci.ini
+          echo "ar      = '$TOOLCHAIN/arm-rockchip830-linux-uclibcgnueabihf-ar'" >> cross/luckfox-rv1106-ci.ini
+          echo "strip   = '$TOOLCHAIN/arm-rockchip830-linux-uclibcgnueabihf-strip'" >> cross/luckfox-rv1106-ci.ini
+          echo "pkg-config = '/usr/local/bin/arm-rockchip830-linux-uclibcgnueabihf-pkg-config'" >> cross/luckfox-rv1106-ci.ini
+          echo "" >> cross/luckfox-rv1106-ci.ini
+          echo "[properties]" >> cross/luckfox-rv1106-ci.ini
+          echo "sys_root        = '$SYSROOT'" >> cross/luckfox-rv1106-ci.ini
+          echo "pkg_config_libdir = '$SYSROOT/usr/lib/pkgconfig:$SYSROOT/usr/share/pkgconfig'" >> cross/luckfox-rv1106-ci.ini
+          echo "" >> cross/luckfox-rv1106-ci.ini
+          echo "[host_machine]" >> cross/luckfox-rv1106-ci.ini
+          echo "system     = 'linux'" >> cross/luckfox-rv1106-ci.ini
+          echo "cpu_family = 'arm'" >> cross/luckfox-rv1106-ci.ini
+          echo "cpu        = 'cortex-a7'" >> cross/luckfox-rv1106-ci.ini
+          echo "endian     = 'little'" >> cross/luckfox-rv1106-ci.ini
+
+      # ── Build ─────────────────────────────────────────────────────────────
+
+      - name: Configure (meson)
+        run: |
+          SYSROOT=$GITHUB_WORKSPACE/sysroot
+          meson setup build-luckfox \
+            --cross-file cross/luckfox-rv1106-ci.ini \
+            -Dtarget=v4l2 \
+            -Dluckfox_sysroot="$SYSROOT" \
+            --buildtype=release
+
+      - name: Build (ninja)
+        run: ninja -C build-luckfox
+
+      # ── Artifact ──────────────────────────────────────────────────────────
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: yolo_v4l2-luckfox-rv1106
+          path: build-luckfox/yolo_v4l2

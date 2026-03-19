@@ -20,6 +20,7 @@
 #include "mjpeg_streamer.h"
 #include "sse_server.h"
 #include "http_server.h"
+#include "wifi_manager.h"
 
 #include <cctype>
 #include <cerrno>
@@ -55,6 +56,7 @@ struct TrapConfig {
     MjpegStreamerConfig stream;
     SseConfig           sse;
     HttpServerConfig    http;
+    WifiConfig          wifi;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -213,6 +215,11 @@ static bool loadConfig(const char* path, TrapConfig& cfg) {
 
             } else if (section == "api") {
                 if (key == "port") cfg.http.port = detail::toInt(val);
+
+            } else if (section == "wifi") {
+                if      (key == "ap_password") cfg.wifi.apPassword = val;
+                else if (key == "iface")       cfg.wifi.iface      = val;
+                else if (key == "creds_path")  cfg.wifi.credsPath  = val;
 
             } else if (section == "database") {
                 if (key == "path") cfg.dbPath = val;

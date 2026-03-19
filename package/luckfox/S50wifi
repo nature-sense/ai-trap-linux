@@ -1,0 +1,129 @@
+#!/bin/sh
+# /etc/init.d/S50wifi
+# WiFi init for ai-trap on Luckfox Pico Zero (AIC8800DC)
+#
+# Behaviour:
+#   If /opt/trap/wifi_creds.conf exists  → station mode (join saved network)
+#   Otherwise                            → AP mode    (phone-provisioning)
+#
+# AP details:
+#   SSID     : ai-trap-<TRAP_ID>   (set TRAP_ID below to match trap_config)
+#   Password : read from AP_PASS below
+#   IP       : 192.168.4.1
+#
+# To switch modes at runtime use the REST API:
+#   POST http://192.168.4.1:8080/api/wifi        {"ssid":"...","password":"..."}
+#   POST http://<station-ip>:8080/api/wifi/reset
+#
+# NOTE: hw_mode MUST be 'g' for AIC8800DC — 'n' causes errno -22.
+
+IFACE=wlan0
+TRAP_ID=luckfox_001
+AP_PASS=aiwildlife
+AP_IP=192.168.4.1
+AP_NETMASK=255.255.255.0
+CHANNEL=6
+CREDS=/opt/trap/wifi_creds.conf
+HOSTAPD_CONF=/tmp/ai-trap-hostapd.conf
+DNSMASQ_CONF=/tmp/ai-trap-dnsmasq.conf
+WPA_CONF=/tmp/ai-trap-wpa.conf
+
+start_ap() {
+    echo "WiFi: starting AP mode (SSID=ai-trap-${TRAP_ID})"
+
+    ip addr flush dev "$IFACE" 2>/dev/null
+    ip link set "$IFACE" up
+    ip addr add "${AP_IP}/${AP_NETMASK}" dev "$IFACE"
+
+    cat > "$HOSTAPD_CONF" << EOF
+interface=$IFACE
+driver=nl80211
+ssid=ai-trap-$TRAP_ID
+hw_mode=g
+channel=$CHANNEL
+wpa=2
+wpa_passphrase=$AP_PASS
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+ignore_broadcast_ssid=0
+EOF
+
+    cat > "$DNSMASQ_CONF" << EOF
+interface=$IFACE
+dhcp-range=192.168.4.2,192.168.4.20,255.255.255.0,1h
+no-resolv
+no-hosts
+address=/#/$AP_IP
+EOF
+
+    hostapd -B "$HOSTAPD_CONF" || { echo "WiFi: hostapd failed"; return 1; }
+    dnsmasq --conf-file="$DNSMASQ_CONF" --pid-file=/tmp/dnsmasq.pid \
+        || { echo "WiFi: dnsmasq failed"; return 1; }
+    echo "WiFi: AP ready — connect to ai-trap-${TRAP_ID} at ${AP_IP}"
+}
+
+start_station() {
+    SSID="$1"
+    PASS="$2"
+    echo "WiFi: starting station mode (SSID=${SSID})"
+
+    ip addr flush dev "$IFACE" 2>/dev/null
+    ip link set "$IFACE" up
+
+    cat > "$WPA_CONF" << EOF
+ctrl_interface=/var/run/wpa_supplicant
+ctrl_interface_group=0
+update_config=1
+
+network={
+    ssid="$SSID"
+    psk="$PASS"
+    key_mgmt=WPA-PSK
+}
+EOF
+
+    mkdir -p /var/run/wpa_supplicant
+    wpa_supplicant -B -i "$IFACE" -c "$WPA_CONF" \
+        || { echo "WiFi: wpa_supplicant failed"; return 1; }
+    udhcpc -i "$IFACE" -b -q -t 15 2>/dev/null
+    IP=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -oP '(?<=inet )\S+' | cut -d/ -f1)
+    echo "WiFi: station connected — IP=${IP:-pending}"
+}
+
+case "$1" in
+  start)
+    killall wpa_supplicant hostapd dnsmasq udhcpc 2>/dev/null
+    sleep 1
+
+    if [ -f "$CREDS" ]; then
+        SSID=$(grep '^ssid='     "$CREDS" | cut -d= -f2-)
+        PASS=$(grep '^password=' "$CREDS" | cut -d= -f2-)
+        if [ -n "$SSID" ]; then
+            start_station "$SSID" "$PASS" || start_ap
+        else
+            start_ap
+        fi
+    else
+        start_ap
+    fi
+    ;;
+
+  stop)
+    echo "WiFi: stopping"
+    killall wpa_supplicant hostapd dnsmasq udhcpc 2>/dev/null
+    ip addr flush dev "$IFACE" 2>/dev/null
+    ;;
+
+  restart)
+    "$0" stop
+    sleep 1
+    "$0" start
+    ;;
+
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac
+
+exit 0

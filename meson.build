@@ -168,6 +168,7 @@ shared_sources = files(
   'firmware/src/server/sse_server.cpp',
   'firmware/src/server/http_server.cpp',
   'firmware/src/common/stb_image_write_impl.cpp',
+  'firmware/src/common/wifi_manager.cpp',
 )
 
 shared_deps = [ncnn_dep, sqlite3_dep, thread_dep, omp_dep,]
@@ -193,6 +194,7 @@ if target_opt == 'libcamera' or target_opt == 'all'
     ),
     include_directories : inc,
     dependencies        : shared_deps + [libcamera_dep],
+    cpp_args            : ['-DWIFI_BACKEND_NM'],
   )
 endif
 
@@ -206,5 +208,6 @@ if target_opt == 'v4l2' or target_opt == 'all'
     ),
     include_directories : inc,
     dependencies        : shared_deps,
+    cpp_args            : ['-DWIFI_BACKEND_HOSTAPD'],
   )
 endif

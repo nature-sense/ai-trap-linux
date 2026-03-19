@@ -1,6 +1,7 @@
 #include "http_server.h"
 #include "sse_server.h"
 #include "persistence.h"
+#include "wifi_manager.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -385,6 +386,24 @@ void HttpServer::routeGet(int fd, const Request& req) {
         return;
     }
 
+    // GET /api/wifi
+    if (req.path == "/api/wifi") {
+        if (!m_wifi) {
+            sendJson(fd, 200, "{\"mode\":\"unknown\",\"ssid\":\"\",\"connected\":false,\"ip\":\"\"}");
+            return;
+        }
+        WifiStatus ws = m_wifi->getStatus();
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "{\"mode\":%s,\"ssid\":%s,\"connected\":%s,\"ip\":%s}",
+                 jsonStr(ws.mode).c_str(),
+                 jsonStr(ws.ssid).c_str(),
+                 ws.connected ? "true" : "false",
+                 jsonStr(ws.ip).c_str());
+        sendJson(fd, 200, buf);
+        return;
+    }
+
     send404(fd);
 }
 
@@ -464,6 +483,43 @@ void HttpServer::routePost(int fd, const Request& req) {
         char buf[128];
         snprintf(buf, sizeof(buf), "{\"acked\":%d}", n);
         sendJson(fd, 200, buf);
+        return;
+    }
+
+    // POST /api/wifi  — body: {"ssid":"MyNet","password":"secret"}
+    if (req.path == "/api/wifi") {
+        if (!m_wifi) {
+            sendJson(fd, 400, "{\"error\":\"wifi management not available\"}");
+            return;
+        }
+        std::string ssid = jsonStringValue(req.body, "ssid");
+        std::string pass = jsonStringValue(req.body, "password");
+        if (ssid.empty()) {
+            sendJson(fd, 400, "{\"error\":\"ssid is required\"}");
+            return;
+        }
+        // Switching mode is slow; spawn a thread so the response is returned first
+        std::string err = m_wifi->setStation(ssid, pass);
+        if (!err.empty()) {
+            sendJson(fd, 400, ("{\"error\":" + jsonStr(err) + "}"));
+            return;
+        }
+        sendOk(fd);
+        return;
+    }
+
+    // POST /api/wifi/reset  — switch back to AP mode
+    if (req.path == "/api/wifi/reset") {
+        if (!m_wifi) {
+            sendJson(fd, 400, "{\"error\":\"wifi management not available\"}");
+            return;
+        }
+        std::string err = m_wifi->resetToAP();
+        if (!err.empty()) {
+            sendJson(fd, 400, ("{\"error\":" + jsonStr(err) + "}"));
+            return;
+        }
+        sendOk(fd);
         return;
     }
 
@@ -619,6 +675,8 @@ static const char* CORS_HEADERS =
 void HttpServer::sendJson(int fd, int status, const std::string& body) {
     const char* statusStr = (status == 200) ? "200 OK" :
                             (status == 400) ? "400 Bad Request" :
+                            (status == 404) ? "404 Not Found" :
+                            (status == 503) ? "503 Service Unavailable" :
                                              "500 Internal Server Error";
     char hdr[512];
     snprintf(hdr, sizeof(hdr),

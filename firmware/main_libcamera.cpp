@@ -9,6 +9,7 @@
 #include "sync_manager.h"
 #include "trap_events.h"
 #include "config_loader.h"
+#include "wifi_manager.h"
 #include "ncnn/net.h"
 
 #include <atomic>
@@ -248,6 +249,16 @@ int main(int argc, char* argv[]) {
         std::lock_guard<std::mutex> lk(sessionMutex);
         return currentSessionId;
     });
+
+    // ── WiFi manager ──────────────────────────────────────────────────────────
+    // Starts in AP mode on first boot (no creds file).
+    // POST /api/wifi switches to station; POST /api/wifi/reset returns to AP.
+    // Defaults: ap_password="aiwildlife", creds_path="/opt/ai-trap/wifi_creds.conf"
+    // Override any of these in [wifi] in the config file.
+
+    WifiManager wifi(cfg.trapId, cfg.wifi);
+    wifi.applyStartupMode();
+    http.setWifiManager(&wifi);
 
     try {
         http.open(cfg.http, &db, &sse, &sync, &currentFps, &g_capturing);
