@@ -128,3 +128,15 @@ port = 8080
 
 [database]
 path = "detections.db"
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[wifi]
+# AP mode is the default on first boot (no saved credentials).
+# The phone app connects to the AP and calls POST /api/wifi to provision
+# station credentials.  POST /api/wifi/reset returns to AP mode.
+#
+# AP SSID is always "ai-trap-<trap.id>" (max 32 chars).
+ap_password = "aiwildlife"     # WPA2 password for the trap's own AP
+iface       = "wlan0"          # WiFi interface name
+creds_path  = "/opt/ai-trap/wifi_creds.conf"  # where station creds are saved

@@ -20,6 +20,10 @@
 //  All JSON responses include CORS headers so a browser-based app works
 //  over USB NCM without a proxy.
 //
+//    GET  /api/wifi            → JSON: {"mode":"ap","ssid":"ai-trap-001","connected":false,"ip":"192.168.4.1"}
+//    POST /api/wifi            → body: {"ssid":"MyNet","password":"secret"}  switch to station mode
+//    POST /api/wifi/reset      → switch back to AP mode
+//
 //  Usage:
 //    HttpServer http;
 //    http.open(cfg, &db, &sse, cropsDir, trapId);
@@ -34,6 +38,7 @@
 // Forward declarations — avoid pulling in heavy headers here
 class SqliteWriter;
 class SseServer;
+class WifiManager;
 struct DetectionStats;
 
 struct HttpServerConfig {
@@ -68,6 +73,9 @@ public:
     void setAfTriggerCallback(AfTriggerCb cb) { m_afTriggerCb = std::move(cb); }
     void setCaptureCallback  (CaptureCb   cb) { m_captureCb   = std::move(cb); }
     void setSessionIdCallback(SessionIdCb cb) { m_sessionIdCb = std::move(cb); }
+
+    // Optional: provide a WifiManager instance to enable /api/wifi endpoints
+    void setWifiManager(WifiManager* wm) { m_wifi = wm; }
 
     // fps pointer is read on every /api/status request (updated by main loop)
     // capturing pointer reflects the current detection state
@@ -121,8 +129,9 @@ private:
     HttpServerConfig m_cfg;
     SqliteWriter*    m_db   = nullptr;
     SyncManager*     m_sync = nullptr;
-    SseServer*       m_sse = nullptr;
-    const float*     m_fps = nullptr;
+    SseServer*       m_sse  = nullptr;
+    WifiManager*     m_wifi = nullptr;
+    const float*     m_fps  = nullptr;
 
     int              m_listenFd = -1;
     std::atomic<bool>m_running{false};

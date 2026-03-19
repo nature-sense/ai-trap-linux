@@ -1,9 +1,13 @@
-#include "src/v4l2_capture.h"
-#include "src/decoder.h"
-#include "src/tracker.h"
-#include "src/persistence.h"
-#include "src/crop_saver.h"
-#include "src/mjpeg_streamer.h"
+#include "v4l2_capture.h"
+#include "decoder.h"
+#include "tracker.h"
+#include "persistence.h"
+#include "crop_saver.h"
+#include "mjpeg_streamer.h"
+#include "sse_server.h"
+#include "http_server.h"
+#include "sync_manager.h"
+#include "wifi_manager.h"
 #include "ncnn/net.h"
 
 #include <atomic>
@@ -112,6 +116,48 @@ int main(int argc, char* argv[]) {
         crops.close();
         db.close();
         return 1;
+    }
+
+    // ── SSE server ────────────────────────────────────────────────────────────
+    SseServer sse;
+    SseConfig sseCfg;
+    sseCfg.port = 8081;
+    try {
+        sse.open(sseCfg);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Warning: cannot start SSE server: %s\n", e.what());
+        // non-fatal — continue without SSE
+    }
+
+    // ── Sync manager ──────────────────────────────────────────────────────────
+    SyncManager sync;
+    sync.init(db.rawDb(), cropCfg.outputDir);
+
+    // ── HTTP API server ───────────────────────────────────────────────────────
+    float currentFps = 0.f;
+    std::atomic<bool> g_capturing{true};
+
+    HttpServer    http;
+    HttpServerConfig httpCfg;
+    httpCfg.port     = 8080;
+    httpCfg.cropsDir = cropCfg.outputDir;
+    httpCfg.trapId   = "luckfox_001";
+
+    // ── WiFi manager ──────────────────────────────────────────────────────────
+    // Luckfox: creds live in /opt/trap/ (writable on Buildroot rootfs).
+    // On first boot (no creds) the trap starts in AP mode so the phone app
+    // can reach it and call POST /api/wifi to provision station credentials.
+    WifiConfig wifiCfg;
+    wifiCfg.credsPath = "/opt/trap/wifi_creds.conf";
+    WifiManager wifi(httpCfg.trapId, wifiCfg);
+    wifi.applyStartupMode();
+    http.setWifiManager(&wifi);
+
+    try {
+        http.open(httpCfg, &db, &sse, &sync, &currentFps, &g_capturing);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Warning: cannot start HTTP server: %s\n", e.what());
+        // non-fatal — continue without REST API
     }
 
     // ── ncnn model ────────────────────────────────────────────────────────────
@@ -311,6 +357,8 @@ int main(int argc, char* argv[]) {
     // ── Shutdown ──────────────────────────────────────────────────────────────
     printf("\nShutting down...\n");
     cam.stop();
+    http.close();
+    sse.close();
     streamer.close();
     crops.flush();
     crops.close();
