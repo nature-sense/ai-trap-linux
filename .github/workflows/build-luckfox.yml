@@ -32,7 +32,6 @@ env:
   NCNN_VERSION:   20240410
   SQLITE_VERSION: 3450100
   SQLITE_YEAR:    2024
-  BLUEZ_VERSION:  "5.66"
   ARM_FLAGS:      -march=armv7-a -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -O2
 
 jobs:
@@ -52,7 +51,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build meson pkg-config \
-            curl ca-certificates git
+            curl ca-certificates git \
+            libbluetooth-dev
 
       # ── Toolchain ───────────────────────────────────────────────────────────
       #
@@ -113,19 +113,19 @@ jobs:
           key: luckfox-sysroot-sqlite${{ env.SQLITE_VERSION }}-ncnn${{ env.NCNN_VERSION }}-v1
 
       # ── BlueZ headers ───────────────────────────────────────────────────────
-      # Extracted AFTER cache restore so headers are always present whether the
-      # sysroot was restored from cache or freshly built.  They are not cached
-      # themselves — the tarball is tiny and the download is fast.
-      # Only header macros/inlines are used; no libbluetooth linkage at runtime.
+      # Copied from the host libbluetooth-dev package (installed above).
+      # BlueZ headers are pure C with no arch-specific content, so the host
+      # x86-64 headers are correct for cross-compilation to armv7.
+      # Done AFTER cache restore so headers are always present whether the
+      # sysroot was restored from cache or freshly built.
 
-      - name: Extract BlueZ headers into sysroot
+      - name: Copy BlueZ headers into sysroot
         run: |
           mkdir -p ${{ env.SYSROOT }}/usr/include/bluetooth
-          curl -fsSL "https://www.kernel.org/pub/linux/bluetooth/bluez-${{ env.BLUEZ_VERSION }}.tar.xz" \
-            | tar xJ --strip-components=2 \
-                     --wildcards \
-                     -C ${{ env.SYSROOT }}/usr/include/bluetooth \
-                     "bluez-${{ env.BLUEZ_VERSION }}/lib/*.h"
+          cp -v /usr/include/bluetooth/bluetooth.h ${{ env.SYSROOT }}/usr/include/bluetooth/
+          cp -v /usr/include/bluetooth/hci.h       ${{ env.SYSROOT }}/usr/include/bluetooth/
+          cp -v /usr/include/bluetooth/hci_lib.h   ${{ env.SYSROOT }}/usr/include/bluetooth/
+          cp -v /usr/include/bluetooth/l2cap.h     ${{ env.SYSROOT }}/usr/include/bluetooth/
           echo "=== BlueZ headers installed ==="
           ls ${{ env.SYSROOT }}/usr/include/bluetooth/
 
