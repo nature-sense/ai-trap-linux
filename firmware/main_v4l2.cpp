@@ -8,6 +8,7 @@
 #include "http_server.h"
 #include "sync_manager.h"
 #include "wifi_manager.h"
+#include "epaper_display.h"
 #include "ncnn/net.h"
 
 #include <atomic>
@@ -152,6 +153,20 @@ int main(int argc, char* argv[]) {
     WifiManager wifi(httpCfg.trapId, wifiCfg);
     wifi.applyStartupMode();
     http.setWifiManager(&wifi);
+
+    // ── e-Paper display ───────────────────────────────────────────────────────
+    // Defaults: disabled. Enable and set GPIO pins in EpaperDisplay::Config.
+    // Luckfox GPIO numbers differ from Pi BCM — set pinDc/pinRst/pinBusy to
+    // match your wiring (sysfs GPIO numbers for the RV1106).
+    EpaperDisplay::Config dispCfg;
+    // dispCfg.enabled    = true;
+    // dispCfg.spiDev     = "/dev/spidev0.0";
+    // dispCfg.pinDc      = 49;   // GPIO1_C1 on Luckfox — adjust to your wiring
+    // dispCfg.pinRst     = 50;
+    // dispCfg.pinBusy    = 51;
+    EpaperDisplay disp;
+    if (dispCfg.enabled)
+        disp.open(dispCfg);
 
     try {
         http.open(httpCfg, &db, &sse, &sync, &currentFps, &g_capturing);
@@ -336,6 +351,7 @@ int main(int argc, char* argv[]) {
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     auto lastStats = std::chrono::steady_clock::now();
+    auto startTime = lastStats;
 
     while (!g_stop.load() && cam.isRunning()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -350,6 +366,28 @@ int main(int argc, char* argv[]) {
                    (double)db.fileSizeBytes() / 1e6);
             crops.printStats();
             streamer.printStats();
+
+            if (disp.isOpen()) {
+                auto t = std::chrono::system_clock::to_time_t(
+                             std::chrono::system_clock::now());
+                struct tm tm_buf{};
+                localtime_r(&t, &tm_buf);
+                char tbuf[32];
+                strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M", &tm_buf);
+
+                EpaperDisplay::Content dc;
+                dc.trapId     = "luckfox_001";
+                dc.detections = ds.totalDetections;
+                dc.tracks     = ds.uniqueTracks;
+                dc.uptimeSecs = std::chrono::duration_cast<std::chrono::seconds>(
+                                    now - startTime).count();
+                dc.timeStr    = tbuf;
+                auto ws       = wifi.getStatus();
+                dc.ip         = ws.ip;
+                dc.wifiMode   = ws.mode;
+                disp.update(dc);
+            }
+
             lastStats = now;
         }
     }
@@ -357,6 +395,7 @@ int main(int argc, char* argv[]) {
     // ── Shutdown ──────────────────────────────────────────────────────────────
     printf("\nShutting down...\n");
     cam.stop();
+    disp.close();
     http.close();
     sse.close();
     streamer.close();

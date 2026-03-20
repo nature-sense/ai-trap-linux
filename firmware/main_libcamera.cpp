@@ -11,6 +11,7 @@
 #include "config_loader.h"
 #include "wifi_manager.h"
 #include "ble_gatt_server.h"
+#include "epaper_display.h"
 #include "ncnn/net.h"
 
 #include <atomic>
@@ -277,6 +278,13 @@ int main(int argc, char* argv[]) {
         printf("WiFi/BLE management disabled (wifi.managed = false) — using OS WiFi.\n");
     }
 
+    // ── e-Paper display ───────────────────────────────────────────────────────
+    EpaperDisplay disp;
+    if (cfg.display.enabled) {
+        if (!disp.open(cfg.display))
+            fprintf(stderr, "[epaper] display unavailable — continuing without\n");
+    }
+
     try {
         http.open(cfg.http, &db, &sse, &sync, &currentFps, &g_capturing);
     } catch (const std::exception& e) {
@@ -509,6 +517,29 @@ int main(int argc, char* argv[]) {
                 lastAfState.load(std::memory_order_relaxed),
                 lastLensPos.load(std::memory_order_relaxed)));
 
+            // Update e-paper display
+            if (disp.isOpen()) {
+                auto t = std::chrono::system_clock::to_time_t(
+                             std::chrono::system_clock::now());
+                struct tm tm_buf{};
+                localtime_r(&t, &tm_buf);
+                char tbuf[32];
+                strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M", &tm_buf);
+
+                EpaperDisplay::Content dc;
+                dc.trapId     = cfg.trapId;
+                dc.detections = ds.totalDetections;
+                dc.tracks     = ds.uniqueTracks;
+                dc.uptimeSecs = uptimeS;
+                dc.timeStr    = tbuf;
+                if (cfg.wifi.managed) {
+                    auto ws   = wifi.getStatus();
+                    dc.ip     = ws.ip;
+                    dc.wifiMode = ws.mode;
+                }
+                disp.update(dc);
+            }
+
             lastStats = now;
             (void)elapsed;
         }
@@ -522,6 +553,7 @@ int main(int argc, char* argv[]) {
     else
         printf("\nCamera stopped unexpectedly — shutting down...\n");
     cam.stop();
+    disp.close();
     http.close();
     sse.close();
     streamer.close();

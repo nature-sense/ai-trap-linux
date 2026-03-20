@@ -21,6 +21,7 @@
 #include "sse_server.h"
 #include "http_server.h"
 #include "wifi_manager.h"
+#include "epaper_display.h"
 
 #include <cctype>
 #include <cerrno>
@@ -57,6 +58,7 @@ struct TrapConfig {
     SseConfig           sse;
     HttpServerConfig    http;
     WifiConfig          wifi;
+    EpaperDisplay::Config display;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -227,6 +229,14 @@ static bool loadConfig(const char* path, TrapConfig& cfg) {
 
             } else if (section == "database") {
                 if (key == "path") cfg.dbPath = val;
+
+            } else if (section == "display") {
+                if      (key == "enabled")      cfg.display.enabled    = detail::toBool(val);
+                else if (key == "spi_dev")      cfg.display.spiDev     = val;
+                else if (key == "pin_dc")       cfg.display.pinDc      = detail::toInt(val);
+                else if (key == "pin_rst")      cfg.display.pinRst     = detail::toInt(val);
+                else if (key == "pin_busy")     cfg.display.pinBusy    = detail::toInt(val);
+                else if (key == "spi_speed_hz") cfg.display.spiSpeedHz = detail::toInt(val);
             }
 
         } catch (const std::exception& e) {

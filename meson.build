@@ -176,6 +176,7 @@ shared_sources = files(
   'firmware/src/common/stb_image_write_impl.cpp',
   'firmware/src/common/wifi_manager.cpp',
   'firmware/src/common/ble_gatt_server.cpp',
+  'firmware/src/common/epaper_display.cpp',
 )
 
 shared_deps = [ncnn_dep, sqlite3_dep, thread_dep, omp_dep]

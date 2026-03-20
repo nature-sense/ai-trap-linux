@@ -144,3 +144,27 @@ managed     = true
 ap_password = "aiwildlife"     # WPA2 password for the trap's own AP
 iface       = "wlan0"          # WiFi interface name
 creds_path  = "/opt/ai-trap/wifi_creds.conf"  # where station creds are saved
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[display]
+# Waveshare 2.13" e-Paper HAT (250×122 px, B&W, SPI)
+# Set enabled = true and configure SPI/GPIO pins for your hardware.
+#
+# Raspberry Pi 5 (BCM GPIO numbers — HAT uses hardware SPI0):
+#   spi_dev  = "/dev/spidev0.0"
+#   pin_dc   = 25
+#   pin_rst  = 17
+#   pin_busy = 24
+#
+# Luckfox Pico Zero (sysfs GPIO numbers — enable SPI via luckfox-config first):
+#   spi_dev  = "/dev/spidev0.0"
+#   pin_dc   = 54    # example — set to match your wiring
+#   pin_rst  = 55
+#   pin_busy = 56
+enabled  = false
+spi_dev  = "/dev/spidev0.0"
+pin_dc   = 25
+pin_rst  = 17
+pin_busy = 24
+# spi_speed_hz = 2000000
