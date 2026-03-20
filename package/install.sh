@@ -87,6 +87,20 @@ systemctl disable --now bluetooth.service 2>/dev/null || true
 # Also mask so it can't be accidentally started by another unit
 systemctl mask bluetooth.service 2>/dev/null || true
 
+# ── Configure camera hardware ────────────────────────────────────────────────
+# Enable the IMX708 camera on CAM1 connector (CM5 hardware)
+
+BOOT_CONFIG="/boot/firmware/config.txt"
+OVERLAY_LINE="dtoverlay=imx708,cam1"
+
+if grep -qF "${OVERLAY_LINE}" "${BOOT_CONFIG}" 2>/dev/null; then
+    info "Camera overlay already present in ${BOOT_CONFIG} — skipping."
+else
+    info "Adding camera overlay to ${BOOT_CONFIG}..."
+    echo "${OVERLAY_LINE}" | tee -a "${BOOT_CONFIG}" > /dev/null
+    info "Camera overlay added — a reboot is required for it to take effect."
+fi
+
 # ── Install systemd service ───────────────────────────────────────────────────
 
 info "Installing systemd service..."
