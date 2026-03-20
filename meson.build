@@ -175,6 +175,10 @@ shared_sources = files(
   'firmware/src/server/http_server.cpp',
   'firmware/src/common/stb_image_write_impl.cpp',
   'firmware/src/common/wifi_manager.cpp',
+)
+
+# BLE GATT server — Pi 5 (CM5) only; the Luckfox RV1106 has no Bluetooth hardware.
+ble_sources = files(
   'firmware/src/common/ble_gatt_server.cpp',
 )
 
@@ -195,7 +199,7 @@ if target_opt == 'libcamera' or target_opt == 'all'
           'On the Luckfox cross-build host use -Dtarget=v4l2 instead.')
   endif
   executable('yolo_libcamera',
-    sources : shared_sources + files(
+    sources : shared_sources + ble_sources + files(
       'firmware/src/io/libcamera_capture.cpp',
       'firmware/main_libcamera.cpp',
     ),
