@@ -38,6 +38,7 @@ struct WifiStatus {
 };
 
 struct WifiConfig {
+    bool        managed           = true;  // false = skip AP/BLE management; use OS WiFi as-is
     std::string apPassword        = "aiwildlife";
     std::string iface             = "wlan0";
     std::string credsPath         = "/opt/ai-trap/wifi_creds.conf";

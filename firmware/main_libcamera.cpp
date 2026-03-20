@@ -251,29 +251,31 @@ int main(int argc, char* argv[]) {
         return currentSessionId;
     });
 
-    // ── WiFi manager ──────────────────────────────────────────────────────────
-    // Starts in AP mode on first boot (no creds file).
-    // POST /api/wifi switches to station; POST /api/wifi/reset returns to AP.
-    // Defaults: ap_password="aiwildlife", creds_path="/opt/ai-trap/wifi_creds.conf"
-    // Override any of these in [wifi] in the config file.
+    // ── WiFi + BLE management ─────────────────────────────────────────────────
+    // Skipped when wifi.managed = false in trap_config.toml (e.g. dev Pi that
+    // stays on a known network — OS handles WiFi, BLE stays idle).
 
-    WifiManager wifi(cfg.trapId, cfg.wifi);
-    wifi.applyStartupMode();
-    http.setWifiManager(&wifi);
-
-    // ── BLE GATT server ───────────────────────────────────────────────────────
-    // Pure C++ — no Python, no D-Bus. Uses raw HCI + L2CAP ATT sockets.
-    // Note: bluetoothd must be stopped on Pi 5 (done by install.sh):
-    //   sudo systemctl disable --now bluetooth
+    WifiManager  wifi(cfg.trapId, cfg.wifi);
     BleGattServer ble;
-    {
+
+    if (cfg.wifi.managed) {
+        // Starts in AP mode on first boot (no creds file).
+        // POST /api/wifi switches to station; POST /api/wifi/reset returns to AP.
+        wifi.applyStartupMode();
+        http.setWifiManager(&wifi);
+
+        // Pure C++ BLE GATT server — no Python, no D-Bus.
+        // Note: bluetoothd must be stopped (done by install.sh).
         BleGattConfig bleCfg;
         bleCfg.name   = "AI-Trap-" + cfg.trapId;
         bleCfg.hciDev = 0;
         ble.open(bleCfg, &wifi);
+
+        // Notify BLE client whenever WiFi state changes (inactivity shutdown etc.)
+        wifi.setInactiveCallback([&]() { ble.notifyStateChanged(); });
+    } else {
+        printf("WiFi/BLE management disabled (wifi.managed = false) — using OS WiFi.\n");
     }
-    // Notify BLE client whenever WiFi state changes (inactivity shutdown etc.)
-    wifi.setInactiveCallback([&]() { ble.notifyStateChanged(); });
 
     try {
         http.open(cfg.http, &db, &sse, &sync, &currentFps, &g_capturing);

@@ -89,6 +89,9 @@ static std::string unquote(const std::string& s) {
 
 static float toFloat(const std::string& s) { return std::stof(s); }
 static int   toInt  (const std::string& s) { return std::stoi(s); }
+static bool  toBool (const std::string& s) {
+    return s == "true" || s == "1" || s == "yes";
+}
 
 } // namespace detail
 
@@ -217,7 +220,8 @@ static bool loadConfig(const char* path, TrapConfig& cfg) {
                 if (key == "port") cfg.http.port = detail::toInt(val);
 
             } else if (section == "wifi") {
-                if      (key == "ap_password") cfg.wifi.apPassword = val;
+                if      (key == "managed")     cfg.wifi.managed    = detail::toBool(val);
+                else if (key == "ap_password") cfg.wifi.apPassword = val;
                 else if (key == "iface")       cfg.wifi.iface      = val;
                 else if (key == "creds_path")  cfg.wifi.credsPath  = val;
 

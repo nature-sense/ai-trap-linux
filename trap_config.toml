@@ -132,6 +132,10 @@ path = "detections.db"
 # ─────────────────────────────────────────────────────────────────────────────
 
 [wifi]
+# managed = true   →  AP/BLE provisioning active (production default).
+# managed = false  →  WiFi/BLE stack skipped; OS handles WiFi as normal.
+#                     Use this on a development Pi already on a known network.
+managed     = true
 # AP mode is the default on first boot (no saved credentials).
 # The phone app connects to the AP and calls POST /api/wifi to provision
 # station credentials.  POST /api/wifi/reset returns to AP mode.
