@@ -207,11 +207,22 @@ jobs:
             echo "sys_root          = '${SYSROOT}'"
             echo "pkg_config_libdir = '${SYSROOT}/usr/lib/pkgconfig:${SYSROOT}/usr/share/pkgconfig'"
             echo "cmake_prefix_path = ['${SYSROOT}/usr']"
+            echo ""
+            echo "[built-in options]"
+            echo "cpp_args = ['-isystem', '${SYSROOT}/usr/include']"
+            echo "c_args   = ['-isystem', '${SYSROOT}/usr/include']"
           } > "$OUT"
           echo "=== Generated cross file ==="
           cat "$OUT"
 
       # ── Meson configure + build ─────────────────────────────────────────────
+
+      - name: Verify BlueZ headers in sysroot
+        run: |
+          echo "=== Bluetooth headers in sysroot ==="
+          ls -la ${{ env.SYSROOT }}/usr/include/bluetooth/ || echo "MISSING - bluetooth dir not found"
+          echo "=== Cross file contents ==="
+          cat cross/luckfox-rv1106-ci.ini
 
       - name: Configure (meson)
         run: |
