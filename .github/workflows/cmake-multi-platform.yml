@@ -44,7 +44,7 @@ jobs:
       - name: Install host build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build python3-pip
+          sudo apt-get install -y cmake ninja-build python3-pip libbluetooth-dev
           pip3 install 'meson>=1.3'
 
       # ── Sysroot (cross-compiled NCNN + SQLite3) ────────────────────────────
@@ -116,6 +116,20 @@ jobs:
             -G Ninja
           ninja -C ncnn-build install
 
+      # ── BlueZ headers ────────────────────────────────────────────────────
+      # Done after sysroot cache restore so headers are always present.
+
+      - name: Copy BlueZ headers into sysroot
+        run: |
+          SYSROOT=$GITHUB_WORKSPACE/sysroot
+          mkdir -p "$SYSROOT/usr/include/bluetooth"
+          cp -v /usr/include/bluetooth/bluetooth.h "$SYSROOT/usr/include/bluetooth/"
+          cp -v /usr/include/bluetooth/hci.h       "$SYSROOT/usr/include/bluetooth/"
+          cp -v /usr/include/bluetooth/hci_lib.h   "$SYSROOT/usr/include/bluetooth/"
+          cp -v /usr/include/bluetooth/l2cap.h     "$SYSROOT/usr/include/bluetooth/"
+          echo "=== BlueZ headers installed ==="
+          ls "$SYSROOT/usr/include/bluetooth/"
+
       # ── pkg-config wrapper ────────────────────────────────────────────────
       # Meson needs a cross pkg-config that searches the sysroot lib dirs.
 
@@ -158,6 +172,10 @@ jobs:
           echo "cpu_family = 'arm'" >> cross/luckfox-rv1106-ci.ini
           echo "cpu        = 'cortex-a7'" >> cross/luckfox-rv1106-ci.ini
           echo "endian     = 'little'" >> cross/luckfox-rv1106-ci.ini
+          echo "" >> cross/luckfox-rv1106-ci.ini
+          echo "[built-in options]" >> cross/luckfox-rv1106-ci.ini
+          echo "cpp_args = ['-isystem', '$SYSROOT/usr/include']" >> cross/luckfox-rv1106-ci.ini
+          echo "c_args   = ['-isystem', '$SYSROOT/usr/include']" >> cross/luckfox-rv1106-ci.ini
 
       # ── Build ─────────────────────────────────────────────────────────────
 
