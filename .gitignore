@@ -15,3 +15,9 @@ crops/
 *.db
 *.db-wal
 *.db-shm
+
+# Package build artifacts (binary, bundled libs, models — generated not source)
+package/bin/
+package/lib/
+package/models/
+package/share/

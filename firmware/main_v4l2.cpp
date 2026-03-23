@@ -165,8 +165,8 @@ int main(int argc, char* argv[]) {
     // dispCfg.pinRst     = 50;
     // dispCfg.pinBusy    = 51;
     EpaperDisplay disp;
-    if (dispCfg.enabled)
-        disp.open(dispCfg);
+    if (dispCfg.enabled && disp.open(dispCfg))
+        disp.showLoading(httpCfg.trapId);
 
     try {
         http.open(httpCfg, &db, &sse, &sync, &currentFps, &g_capturing);

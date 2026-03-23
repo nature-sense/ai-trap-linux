@@ -281,7 +281,9 @@ int main(int argc, char* argv[]) {
     // ── e-Paper display ───────────────────────────────────────────────────────
     EpaperDisplay disp;
     if (cfg.display.enabled) {
-        if (!disp.open(cfg.display))
+        if (disp.open(cfg.display))
+            disp.showLoading(cfg.trapId);
+        else
             fprintf(stderr, "[epaper] display unavailable — continuing without\n");
     }
 

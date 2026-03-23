@@ -16,8 +16,8 @@ location = ""
 # ─────────────────────────────────────────────────────────────────────────────
 
 [model]
-param       = "../firmware/models/yolo11n-320/model.ncnn.param"
-bin         = "../firmware/models/yolo11n-320/model.ncnn.bin"
+param       = "models/yolo11n-320/model.ncnn.param"
+bin         = "models/yolo11n-320/model.ncnn.bin"
 width       = 320           # must match the ncnn export imgsz
 height      = 320
 num_classes = 1             # 1 for single-class insect model
@@ -135,7 +135,7 @@ path = "detections.db"
 # managed = true   →  AP/BLE provisioning active (production default).
 # managed = false  →  WiFi/BLE stack skipped; OS handles WiFi as normal.
 #                     Use this on a development Pi already on a known network.
-managed     = false   # dev only — set true in package/config/trap_config.toml for production
+managed     = false
 # AP mode is the default on first boot (no saved credentials).
 # The phone app connects to the AP and calls POST /api/wifi to provision
 # station credentials.  POST /api/wifi/reset returns to AP mode.

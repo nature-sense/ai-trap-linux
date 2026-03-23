@@ -203,6 +203,9 @@ if target_opt == 'libcamera' or target_opt == 'all'
     include_directories : inc,
     dependencies        : shared_deps + [libcamera_dep],
     cpp_args            : ['-DWIFI_BACKEND_NM'],
+    # Bake /opt/ai-trap/lib into the ELF RPATH so the binary finds the
+    # bundled libcamera shared libraries without LD_LIBRARY_PATH.
+    install_rpath       : '/opt/ai-trap/lib',
   )
 endif
 

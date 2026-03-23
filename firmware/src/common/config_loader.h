@@ -296,5 +296,12 @@ static void printConfig(const TrapConfig& cfg) {
            cfg.sse.port, cfg.sse.maxClients);
     printf("│  API           port=%d\n", cfg.http.port);
     printf("│  Database      %s\n", cfg.dbPath.c_str());
+    printf("│  WiFi managed  %s\n", cfg.wifi.managed ? "yes" : "no");
+    printf("│  e-ink display %s",   cfg.display.enabled ? "enabled" : "disabled");
+    if (cfg.display.enabled)
+        printf("  spi=%s  dc=%d  rst=%d  busy=%d",
+               cfg.display.spiDev.c_str(),
+               cfg.display.pinDc, cfg.display.pinRst, cfg.display.pinBusy);
+    printf("\n");
     printf("└───────────────────────────────────────────────────────────\n\n");
 }

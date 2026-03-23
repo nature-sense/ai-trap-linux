@@ -2,7 +2,7 @@
 //  epaper_display.cpp  —  Waveshare 2.13" e-Paper HAT (250×122) driver
 //
 //  EPD model: V3 / V4
-//  Interface: Linux /dev/spidevX.Y + sysfs GPIO
+//  Interface: Linux /dev/spidevX.Y + GPIO chardev (/dev/gpiochipN)
 //  No external library dependencies.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -13,8 +13,11 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <dirent.h>
 #include <fcntl.h>
+#include <linux/gpio.h>
 #include <linux/spi/spidev.h>
+#include <string>
 #include <sys/ioctl.h>
 #include <thread>
 #include <unistd.h>
@@ -137,56 +140,131 @@ EpaperDisplay::~EpaperDisplay() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  GPIO sysfs helpers
+//  GPIO chardev helpers
+//
+//  Uses the Linux GPIO character device interface (/dev/gpiochipN) rather than
+//  the legacy sysfs interface.  On Pi 5 (RP1), the pinctrl driver marks all
+//  pins as "owned" which causes EBUSY on sysfs export; chardev always works.
 // ─────────────────────────────────────────────────────────────────────────────
 
-void EpaperDisplay::gpioExport(int pin) {
-    char buf[8];
-    int len = snprintf(buf, sizeof(buf), "%d", pin);
-    int fd = ::open("/sys/class/gpio/export", O_WRONLY);
-    if (fd < 0) return;  // may already be exported — ignore
-    (void)write(fd, buf, (size_t)len);
-    ::close(fd);
+// Open the /dev/gpiochipN device for the main 40-pin header GPIO controller.
+//
+// Strategy: find the sysfs entry with the highest base that exposes >= 28 lines
+// (the BCM header bank), read its label, then scan /dev/gpiochip0..31 using
+// GPIO_GET_CHIPINFO_IOCTL to find the device node with the matching label.
+//
+// This is necessary because the sysfs entry is named after its base offset
+// (e.g. "gpiochip569" on Pi 5) while the /dev/ node is numbered by chip index
+// (e.g. "/dev/gpiochip0"), so we cannot build the /dev path directly from
+// the sysfs name.
+//
+// Returns an open fd (caller must close) or -1.
+static int openGpioChip() {
+    // Step 1: find the sysfs chip with the highest base that has >= 28 lines.
+    int  highestBase = -1;
+    char bestLabel[64] = {};
+
+    DIR* d = opendir("/sys/class/gpio");
+    if (!d) return -1;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr) {
+        if (strncmp(ent->d_name, "gpiochip", 8) != 0) continue;
+        char basePath[80], ngpioPath[80], labelPath[80];
+        snprintf(basePath,  sizeof(basePath),  "/sys/class/gpio/%s/base",  ent->d_name);
+        snprintf(ngpioPath, sizeof(ngpioPath), "/sys/class/gpio/%s/ngpio", ent->d_name);
+        snprintf(labelPath, sizeof(labelPath), "/sys/class/gpio/%s/label", ent->d_name);
+        int base = -1, ngpio = 0;
+        FILE* fb = fopen(basePath,  "r");
+        FILE* fn = fopen(ngpioPath, "r");
+        if (fb) { fscanf(fb, "%d", &base);  fclose(fb); }
+        if (fn) { fscanf(fn, "%d", &ngpio); fclose(fn); }
+        if (base >= 0 && ngpio >= 28 && base > highestBase) {
+            highestBase = base;
+            FILE* fl = fopen(labelPath, "r");
+            if (fl) {
+                if (fgets(bestLabel, sizeof(bestLabel), fl)) {
+                    // strip trailing newline
+                    size_t l = strlen(bestLabel);
+                    if (l > 0 && bestLabel[l-1] == '\n') bestLabel[l-1] = '\0';
+                }
+                fclose(fl);
+            }
+        }
+    }
+    closedir(d);
+
+    // Step 2: scan /dev/gpiochip0..31 and match by label via GPIO_GET_CHIPINFO_IOCTL.
+    for (int i = 0; i < 32; i++) {
+        char devPath[32];
+        snprintf(devPath, sizeof(devPath), "/dev/gpiochip%d", i);
+        int fd = ::open(devPath, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+
+        struct gpiochip_info info = {};
+        if (ioctl(fd, GPIO_GET_CHIPINFO_IOCTL, &info) < 0) {
+            ::close(fd);
+            continue;
+        }
+
+        bool match = (bestLabel[0] != '\0')
+                   ? (strncmp(info.label, bestLabel, sizeof(info.label)) == 0)
+                   : ((int)info.lines >= 28);  // fallback: first chip with enough lines
+
+        if (match) {
+            fprintf(stderr, "[epaper] GPIO chip: %s (label=%s lines=%u)\n",
+                    devPath, info.label, info.lines);
+            return fd;
+        }
+        ::close(fd);
+    }
+
+    fprintf(stderr, "[epaper] GPIO chip not found (label=%s)\n", bestLabel);
+    return -1;
 }
 
-void EpaperDisplay::gpioUnexport(int pin) {
-    char buf[8];
-    int len = snprintf(buf, sizeof(buf), "%d", pin);
-    int fd = ::open("/sys/class/gpio/unexport", O_WRONLY);
-    if (fd < 0) return;
-    (void)write(fd, buf, (size_t)len);
-    ::close(fd);
+// Request a single output line. Returns the line fd or -1.
+static int gpioRequestOutput(int chipFd, int offset, int initVal, const char* label) {
+    struct gpiohandle_request req = {};
+    req.lineoffsets[0]    = (uint32_t)offset;
+    req.flags             = GPIOHANDLE_REQUEST_OUTPUT;
+    req.default_values[0] = (uint8_t)(initVal ? 1 : 0);
+    req.lines             = 1;
+    strncpy(req.consumer_label, label, sizeof(req.consumer_label) - 1);
+    if (ioctl(chipFd, GPIO_GET_LINEHANDLE_IOCTL, &req) < 0) {
+        fprintf(stderr, "[epaper] request output GPIO%d (%s): %s\n",
+                offset, label, strerror(errno));
+        return -1;
+    }
+    return req.fd;
 }
 
-void EpaperDisplay::gpioDir(int pin, bool output) {
-    char path[64];
-    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/direction", pin);
-    int fd = ::open(path, O_WRONLY);
-    if (fd < 0) return;
-    const char* dir = output ? "out" : "in";
-    (void)write(fd, dir, strlen(dir));
-    ::close(fd);
+// Request a single input line. Returns the line fd or -1.
+static int gpioRequestInput(int chipFd, int offset, const char* label) {
+    struct gpiohandle_request req = {};
+    req.lineoffsets[0] = (uint32_t)offset;
+    req.flags          = GPIOHANDLE_REQUEST_INPUT;
+    req.lines          = 1;
+    strncpy(req.consumer_label, label, sizeof(req.consumer_label) - 1);
+    if (ioctl(chipFd, GPIO_GET_LINEHANDLE_IOCTL, &req) < 0) {
+        fprintf(stderr, "[epaper] request input GPIO%d (%s): %s\n",
+                offset, label, strerror(errno));
+        return -1;
+    }
+    return req.fd;
 }
 
-void EpaperDisplay::gpioWrite(int pin, int value) {
-    char path[64];
-    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", pin);
-    int fd = ::open(path, O_WRONLY);
-    if (fd < 0) return;
-    const char* v = value ? "1" : "0";
-    (void)write(fd, v, 1);
-    ::close(fd);
+void EpaperDisplay::gpioWrite(int lineFd, int value) {
+    if (lineFd < 0) return;
+    struct gpiohandle_data data = {};
+    data.values[0] = (uint8_t)(value ? 1 : 0);
+    ioctl(lineFd, GPIOHANDLE_SET_LINE_VALUES_IOCTL, &data);
 }
 
-int EpaperDisplay::gpioRead(int pin) {
-    char path[64];
-    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", pin);
-    int fd = ::open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    char buf[4] = {};
-    (void)read(fd, buf, sizeof(buf));
-    ::close(fd);
-    return (buf[0] == '1') ? 1 : 0;
+int EpaperDisplay::gpioRead(int lineFd) {
+    if (lineFd < 0) return 0;
+    struct gpiohandle_data data = {};
+    ioctl(lineFd, GPIOHANDLE_GET_LINE_VALUES_IOCTL, &data);
+    return data.values[0];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,38 +332,45 @@ void EpaperDisplay::spiSend(const uint8_t* data, int len) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void EpaperDisplay::reset() {
-    gpioWrite(m_cfg.pinRst, 1);
+    gpioWrite(m_fdRst, 1);
     usleep(20000);
-    gpioWrite(m_cfg.pinRst, 0);
+    gpioWrite(m_fdRst, 0);
     usleep(2000);
-    gpioWrite(m_cfg.pinRst, 1);
+    gpioWrite(m_fdRst, 1);
     usleep(20000);
 }
 
 void EpaperDisplay::waitBusy(int timeoutMs) {
-    auto deadline = std::chrono::steady_clock::now()
-                  + std::chrono::milliseconds(timeoutMs);
-    while (gpioRead(m_cfg.pinBusy) == 1) {   // HIGH = busy
+    auto start    = std::chrono::steady_clock::now();
+    auto deadline = start + std::chrono::milliseconds(timeoutMs);
+    int polls = 0;
+    while (gpioRead(m_fdBusy) == 1) {   // HIGH = busy
         if (std::chrono::steady_clock::now() > deadline) {
             fprintf(stderr, "[epaper] waitBusy timeout (%d ms)\n", timeoutMs);
-            break;
+            return;
         }
         usleep(10000);  // 10 ms poll interval
+        polls++;
+    }
+    if (polls > 0) {
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - start).count();
+        fprintf(stderr, "[epaper] waitBusy done in %lld ms\n", (long long)ms);
     }
 }
 
 void EpaperDisplay::sendCmd(uint8_t cmd) {
-    gpioWrite(m_cfg.pinDc, 0);  // DC low = command
+    gpioWrite(m_fdDc, 0);  // DC low = command
     spiSend(&cmd, 1);
 }
 
 void EpaperDisplay::sendData(uint8_t data) {
-    gpioWrite(m_cfg.pinDc, 1);  // DC high = data
+    gpioWrite(m_fdDc, 1);  // DC high = data
     spiSend(&data, 1);
 }
 
 void EpaperDisplay::sendDataBuf(const uint8_t* buf, int len) {
-    gpioWrite(m_cfg.pinDc, 1);  // DC high = data
+    gpioWrite(m_fdDc, 1);  // DC high = data
     spiSend(buf, len);
 }
 
@@ -296,9 +381,9 @@ void EpaperDisplay::initPanel() {
     sendCmd(0x12);   // SW Reset
     waitBusy();
 
-    // Driver output control: MUX = 121 (0x79), GD=0, SM=0, TB=0
+    // Driver output control: MUX = 249 (0xF9) for 250 gate lines, GD=0, SM=0, TB=0
     sendCmd(0x01);
-    sendData(0x79); sendData(0x00); sendData(0x00);
+    sendData(0xF9); sendData(0x00); sendData(0x00);
 
     // Data entry mode: X+, Y+ (increment X first, then Y)
     sendCmd(0x11);
@@ -317,11 +402,15 @@ void EpaperDisplay::initPanel() {
     sendCmd(0x3C);
     sendData(0x05);
 
+    // Display update control 1: normal source/gate output
+    sendCmd(0x21);
+    sendData(0x00); sendData(0x80);
+
     // Temperature: built-in sensor
     sendCmd(0x18);
     sendData(0x80);
 
-    // Display update control 2 + master activation
+    // Display update control 2 + master activation (full init update)
     sendCmd(0x22);
     sendData(0xF7);
     sendCmd(0x20);
@@ -372,7 +461,7 @@ void EpaperDisplay::fbText(int x, int y, const char* s) {
             uint8_t bits = glyph[row];
             for (int col = 0; col < 8; col++) {
                 if (bits & (0x80 >> col))
-                    fbPixel(x + row, y + col, true);
+                    fbPixel(x + col, y + row, true);
             }
         }
     }
@@ -406,29 +495,70 @@ bool EpaperDisplay::open(Config cfg) {
     if (m_open) return true;
     m_cfg = cfg;
 
-    // Export and configure GPIO pins
-    gpioExport(m_cfg.pinDc);
-    gpioExport(m_cfg.pinRst);
-    gpioExport(m_cfg.pinBusy);
+    fprintf(stderr, "[epaper] open: spi=%s dc=GPIO%d rst=GPIO%d busy=GPIO%d speed=%d\n",
+            m_cfg.spiDev.c_str(),
+            m_cfg.pinDc, m_cfg.pinRst, m_cfg.pinBusy, m_cfg.spiSpeedHz);
 
-    // Allow kernel time to create sysfs entries after export
-    usleep(100000);
-
-    gpioDir(m_cfg.pinDc,   true);   // output
-    gpioDir(m_cfg.pinRst,  true);   // output
-    gpioDir(m_cfg.pinBusy, false);  // input
-
-    if (!spiOpen()) {
-        gpioUnexport(m_cfg.pinDc);
-        gpioUnexport(m_cfg.pinRst);
-        gpioUnexport(m_cfg.pinBusy);
+    // Open the GPIO chip and request lines via chardev (works on Pi 4 and Pi 5).
+    // m_cfg.pinDc/pinRst/pinBusy are BCM GPIO numbers (= line offsets in the chip).
+    int chipFd = openGpioChip();
+    if (chipFd < 0) {
+        fprintf(stderr, "[epaper] cannot open GPIO chip: %s\n", strerror(errno));
         return false;
     }
+    m_fdDc   = gpioRequestOutput(chipFd, m_cfg.pinDc,  0, "epaper-dc");
+    m_fdRst  = gpioRequestOutput(chipFd, m_cfg.pinRst, 1, "epaper-rst");
+    m_fdBusy = gpioRequestInput (chipFd, m_cfg.pinBusy,   "epaper-busy");
+    ::close(chipFd);
 
+    if (m_fdDc < 0 || m_fdRst < 0 || m_fdBusy < 0) {
+        fprintf(stderr, "[epaper] GPIO line request failed\n");
+        if (m_fdDc   >= 0) { ::close(m_fdDc);   m_fdDc   = -1; }
+        if (m_fdRst  >= 0) { ::close(m_fdRst);  m_fdRst  = -1; }
+        if (m_fdBusy >= 0) { ::close(m_fdBusy); m_fdBusy = -1; }
+        return false;
+    }
+    fprintf(stderr, "[epaper] GPIO ok, BUSY=%d\n", gpioRead(m_fdBusy));
+
+    if (!spiOpen()) {
+        ::close(m_fdDc);   m_fdDc   = -1;
+        ::close(m_fdRst);  m_fdRst  = -1;
+        ::close(m_fdBusy); m_fdBusy = -1;
+        return false;
+    }
+    fprintf(stderr, "[epaper] SPI open ok\n");
+
+    fprintf(stderr, "[epaper] initPanel start\n");
     initPanel();
+    fprintf(stderr, "[epaper] initPanel done\n");
+
     fbClear();
     m_open = true;
+    fprintf(stderr, "[epaper] ready\n");
     return true;
+}
+
+void EpaperDisplay::showLoading(const std::string& trapId) {
+    if (!m_open) return;
+
+    fbClear();
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Trap: %s", trapId.c_str());
+    fbText(3, 3, buf);
+
+    fbHLine(0, 249, 16);
+    fbHLine(0, 249, 17);
+
+    fbText(3, 22, "Loading...");
+
+    sendCmd(0x4E); sendData(0x00);
+    sendCmd(0x4F); sendData(0x00); sendData(0x00);
+    sendCmd(0x24);
+    sendDataBuf(m_fb, sizeof(m_fb));
+    sendCmd(0x22); sendData(0xF7);
+    sendCmd(0x20);
+    waitBusy(5000);
 }
 
 void EpaperDisplay::update(const Content& c) {
@@ -448,28 +578,28 @@ void EpaperDisplay::update(const Content& c) {
 
     // Line 1  y=18: "Det: <N>  Trk: <N>"
     snprintf(buf, sizeof(buf), "Det: %d  Trk: %d", c.detections, c.tracks);
-    fbText(18, 3, buf);
+    fbText(3, 18, buf);
 
-    // Horizontal rule 2px above line 2: between y=28 and y=31
-    fbHLine(30, 121, 30);
-    fbHLine(31, 121, 31);
+    // Horizontal rule between line 1 and line 2
+    fbHLine(0, 249, 30);
+    fbHLine(0, 249, 31);
 
     // Line 2  y=33: "IP: <ip>"  or "IP: -" if empty
     snprintf(buf, sizeof(buf), "IP: %s",
              c.ip.empty() ? "-" : c.ip.c_str());
-    fbText(33, 3, buf);
+    fbText(3, 33, buf);
 
     // Line 3  y=48: "WiFi: <mode>"  or "WiFi: unmanaged" if empty
     snprintf(buf, sizeof(buf), "WiFi: %s",
              c.wifiMode.empty() ? "unmanaged" : c.wifiMode.c_str());
-    fbText(48, 3, buf);
+    fbText(3, 48, buf);
 
     // Line 4  y=63: "Up: <Xh Ym>"
     snprintf(buf, sizeof(buf), "Up: %s", fmtUptime(c.uptimeSecs).c_str());
-    fbText(63, 3, buf);
+    fbText(3, 63, buf);
 
     // Line 5  y=78: "<timeStr>"
-    fbText(78, 3, c.timeStr.c_str());
+    fbText(3, 78, c.timeStr.c_str());
 
     // ── Send framebuffer to EPD ───────────────────────────────────────────────
 
@@ -497,8 +627,8 @@ void EpaperDisplay::close() {
     if (!m_open) return;
     sleep();
     spiClose();
-    gpioUnexport(m_cfg.pinDc);
-    gpioUnexport(m_cfg.pinRst);
-    gpioUnexport(m_cfg.pinBusy);
+    if (m_fdDc   >= 0) { ::close(m_fdDc);   m_fdDc   = -1; }
+    if (m_fdRst  >= 0) { ::close(m_fdRst);  m_fdRst  = -1; }
+    if (m_fdBusy >= 0) { ::close(m_fdBusy); m_fdBusy = -1; }
     m_open = false;
 }

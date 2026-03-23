@@ -51,18 +51,16 @@ public:
     ~EpaperDisplay();
 
     bool open(Config cfg);
+    void showLoading(const std::string& trapId);
     void update(const Content& c);
     void sleep();
     void close();
     bool isOpen() const { return m_open; }
 
 private:
-    // ── GPIO sysfs helpers ────────────────────────────────────────────────────
-    static void gpioExport(int pin);
-    static void gpioUnexport(int pin);
-    static void gpioDir(int pin, bool output);
-    static void gpioWrite(int pin, int value);
-    static int  gpioRead(int pin);
+    // ── GPIO chardev helpers ──────────────────────────────────────────────────
+    static void gpioWrite(int lineFd, int value);
+    static int  gpioRead(int lineFd);
 
     // ── SPI ───────────────────────────────────────────────────────────────────
     bool     spiOpen();
@@ -93,5 +91,8 @@ private:
     Config   m_cfg;
     bool     m_open    = false;
     int      m_spiFd   = -1;
+    int      m_fdDc    = -1;   // GPIO chardev line fd: Data/Command
+    int      m_fdRst   = -1;   // GPIO chardev line fd: Reset
+    int      m_fdBusy  = -1;   // GPIO chardev line fd: BUSY (input)
     uint8_t  m_fb[16 * 250];  // 4000-byte framebuffer
 };
