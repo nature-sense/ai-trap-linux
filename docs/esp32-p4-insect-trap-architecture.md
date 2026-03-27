@@ -20,20 +20,21 @@ of 50–200+ traps economically viable.
 | Component | Part | Notes |
 |---|---|---|
 | Inference SoC | M5Stack Stamp-P4 | ESP32-P4NRW32, 32 MB PSRAM, MIPI CSI |
-| Wireless | M5Stack Stamp-AddOn C6 For P4 | ESP32-C6, Wi-Fi 6, BLE 5, Thread/Zigbee |
+| Wireless | See options below | WiFi, LoRaWAN, or Meshtastic |
 | Camera | TBD — CSI-compatible module | Must be compatible with Stamp-P4 CSI interface |
 | Battery | LiPo, 3000–5000 mAh | Or small solar + 1000 mAh |
 | Enclosure | Custom PCB + weatherproof housing | To be designed |
 
 ### Cost model (indicative)
 
-| Item | Approx. cost |
-|---|---|
-| Stamp-P4 | £12–15 |
-| Stamp-AddOn C6 | £5–8 |
-| Camera module | £5–10 |
-| Battery, PCB, enclosure | £8–15 |
-| **Total per trap** | **~£30–50** |
+| Item | WiFi (C6 addon) | LoRaWAN (SX1262) | Meshtastic |
+|---|---|---|---|
+| Stamp-P4 | £12–15 | £12–15 | £12–15 |
+| Radio module | £5–8 (C6 addon) | £5–8 (SX1262 breakout) | £10–20 (T-Beam / Heltec) |
+| Camera module | £5–10 | £5–10 | £5–10 |
+| Battery, PCB, enclosure | £8–15 | £8–15 | £8–15 |
+| **Total per trap** | **~£30–50** | **~£30–50** | **~£35–60** |
+| Gateway cost | None (use existing AP) | £80–150 per site | £30–80 per mesh bridge |
 
 vs. ~£100–150 for a CM5-based trap. At 100 traps: ~£3,000–5,000 vs ~£10,000–15,000.
 
@@ -106,18 +107,21 @@ Wake HP cores (~10 ms)
     ↓
 CSI capture → PPA resize → ESPDet-Pico inference (~55 ms)
     ↓  detection confirmed?
-JPEG encode → transmit via C6 → store event to NVS
+JPEG encode → transmit (WiFi / LoRa / Meshtastic) → store event to NVS
     ↓
 HP cores sleep → LP core resumes watch
 ```
 
 ### Power budget (estimated)
 
-| State | Current | Typical duration |
-|---|---|---|
-| Deep sleep (LP only) | ~1–5 mA | 99% of time in low-activity periods |
-| Active inference | ~200–400 mA | ~100–200 ms per event |
-| Wi-Fi transmit | ~200–300 mA | ~500 ms per event |
+| State | Current | WiFi duration | LoRa duration |
+|---|---|---|---|
+| Deep sleep (LP only) | ~1–5 mA | 99% of time | 99% of time |
+| Active inference | ~200–400 mA | ~100–200 ms | ~100–200 ms |
+| Radio transmit | ~250–300 mA (WiFi) / ~40 mA (LoRa) | ~500 ms | ~50–500 ms |
+
+LoRa transmit current is ~6–7× lower than WiFi and airtime is shorter, making it significantly
+better for battery life in remote deployments.
 
 A 3000 mAh LiPo at 1% duty cycle (moderate insect activity) gives weeks to months of runtime.
 A small solar panel (2–5W) can sustain continuous operation.
@@ -128,19 +132,75 @@ This is fundamentally different from the CM5 which draws 4–8 W continuously re
 
 ## Network architecture
 
-For large-scale deployment, traps connect to a **local gateway** rather than directly to the cloud:
+The counting-only data model produces tiny payloads (~60 bytes per event) making the trap an
+ideal fit for wide-area low-power networking. Three options are viable depending on the deployment
+context.
+
+### Option A — WiFi (M5Stack Stamp-AddOn C6)
 
 ```
-[Trap 001..N]  ──WiFi──►  [Gateway: Pi / PC / cloud VM]  ──4G/Ethernet──►  [Database / dashboard]
+[Trap 001..N]  ──WiFi──►  [AP at field station]  ──4G/Ethernet──►  [Database / dashboard]
 ```
 
-- Traps transmit small JSON events immediately on detection
-- Gateway handles persistence, aggregation, and uplink
-- Traps buffer events in NVS if gateway is temporarily unreachable
-- Gateway can serve OTA firmware updates to the trap fleet
+- Best for traps within ~100 m of a building or field station with power
+- Highest power consumption of the three options
+- Easiest OTA firmware updates and sampled image upload
+- ESP32-C6 also supports Thread/Zigbee for short-range mesh extension
+- Uses M5Stack Stamp-AddOn C6 connected to Stamp-P4 via ESP-Hosted (SPI)
 
-The C6 addon also supports **Thread/Zigbee** (IEEE 802.15.4) which enables mesh networking for
-deployments where individual traps cannot reach a WiFi access point directly.
+### Option B — LoRaWAN (SX1262 module on SPI)
+
+```
+[Trap 001..N]  ──LoRa──►  [LoRaWAN gateway per site]  ──4G/Ethernet──►  [TTN / cloud]  ──►  [Dashboard]
+```
+
+- Best for planned deployments across a defined study area
+- Range: 2–15 km line-of-sight, 1–3 km in dense woodland
+- TX current ~40 mA × 50–500 ms — ~6–7× better battery life than WiFi
+- Payload: 51–222 bytes per uplink — ample for count events, not for images
+- **The Things Network** provides free community gateway coverage in many regions;
+  a self-hosted gateway (~£100, Pi + RAK833) covers a ~5 km radius
+- Replaces the C6 addon entirely — SX1262 breakout connects directly to P4 via SPI,
+  simplifying the design and reducing BOM cost
+- OTA firmware updates over LoRaWAN are very constrained (not recommended for routine use)
+
+### Option C — Meshtastic (LoRa mesh, no gateway infrastructure)
+
+```
+[Trap 001..N]  ──LoRa mesh──►  [Mesh relay nodes]  ──►  [MQTT bridge node]  ──►  [Database]
+```
+
+- Best for remote deployments where installing powered gateway infrastructure is impractical
+- Self-organising mesh — each node relays others' packets; coverage extends with node density
+- One solar-powered relay node per ~5–10 km² can cover large study areas
+- One MQTT bridge node (with internet uplink) serves the whole mesh
+- Higher power than LoRaWAN due to mesh listen overhead
+- Less mature for unattended sensor deployments than LoRaWAN; community firmware
+
+### Comparison
+
+| | WiFi (C6) | LoRaWAN (SX1262) | Meshtastic |
+|---|---|---|---|
+| Range | ~100 m | 2–15 km | 2–15 km/hop, mesh |
+| Infrastructure | Existing AP | Gateway per site | One MQTT bridge |
+| TX power | ~250–300 mA | ~40 mA | ~40 mA + listen |
+| Battery impact | Poor | Excellent | Good |
+| Payload limit | Unlimited | 51–222 bytes | ~240 bytes |
+| Image upload | Yes | No | No |
+| OTA updates | Easy | Very limited | Limited |
+| Ecosystem maturity | High | High | Medium |
+| Radio module | C6 addon £5–8 | SX1262 £5–8 | T-Beam/Heltec £10–20 |
+
+### Recommendation
+
+- **LoRaWAN** is the preferred choice for a structured large-scale deployment — lower power than
+  WiFi, mature ecosystem, and The Things Network removes the need to self-host cloud infrastructure.
+- **Meshtastic** is preferred where powered gateway installation is impractical (remote moorland,
+  forest with no field station).
+- **WiFi** is preferred where traps are near existing infrastructure and OTA updates or sampled
+  image upload are required.
+
+All three options buffer events in NVS when the uplink is unavailable and transmit when back in range.
 
 ---
 
@@ -170,9 +230,10 @@ These must be validated before committing to this architecture:
 2. **Camera module compatibility** — which CSI camera module works with the Stamp-P4, and whether
    M5Stack provides a ready-made option or a custom module is required.
 
-3. **P4 ↔ C6 communication** — M5Stack's implementation of the Stamp-AddOn interface: protocol
-   (ESP-Hosted SPI or ESP-AT UART?), latency, reliability, and whether standard ESP-Hosted drivers
-   work out of the box.
+3. **Radio interface** — for WiFi: P4 ↔ C6 addon protocol (ESP-Hosted SPI or ESP-AT UART?),
+   latency, reliability. For LoRaWAN: SX1262 SPI driver in ESP-IDF, frequency plan and duty
+   cycle compliance for deployment region. For Meshtastic: whether the firmware supports a
+   headless sensor mode suitable for unattended deployment.
 
 4. **Real-world power consumption** — measured wake-detect-transmit-sleep cycle current vs. estimates
    above. LP core sleep current with PIR interrupt wakeup.
@@ -200,10 +261,10 @@ Do not attempt the full pipeline in one step. Validate the highest-risk elements
 - Measure end-to-end latency and power
 
 ### Phase 3 — Wireless (bench)
-- Add Stamp-AddOn C6
-- Transmit detection events to a local gateway
+- Select radio option based on deployment context (see Network architecture above)
+- Transmit detection events to a local gateway or TTN
 - Test NVS buffering when gateway is unreachable
-- Measure power cost of transmit cycle
+- Measure power cost of transmit cycle for chosen radio
 
 ### Phase 4 — Power profiling (bench)
 - Implement full sleep/wake cycle with PIR interrupt
@@ -225,7 +286,9 @@ Do not attempt the full pipeline in one step. Validate the highest-risk elements
 | P4 silicon revision supply chain (v1.0 vs v1.3) | Medium | Check revision before bulk order; see [esp32-p4-ai-evaluation.md](esp32-p4-ai-evaluation.md) |
 | ESP-DL model format instability across versions | Low | Pin ESP-IDF + ESP-DL versions in firmware |
 | DMA SRAM constraint for camera buffers | Medium | Profile in Phase 2; reduce resolution if needed |
-| C6 addon interface complexity | Medium | Resolve in Phase 3 before committing to PCB design |
+| C6/LoRa radio interface complexity | Medium | Resolve in Phase 3 before committing to PCB design |
+| LoRaWAN duty cycle limits (EU: 1%) | Low | Count events are infrequent; batch if needed |
+| Meshtastic firmware stability for unattended sensors | Medium | Validate in Phase 3; fall back to LoRaWAN |
 | Field enclosure / weatherproofing | Medium | Standard IP65 housing solutions exist |
 
 ---
