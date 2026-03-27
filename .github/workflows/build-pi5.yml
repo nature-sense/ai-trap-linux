@@ -257,7 +257,8 @@ jobs:
             trap_config.toml > "${PKG}/config/trap_config.toml"
 
           # Systemd service and install script
-          cp package/ai-trap.service "${PKG}/systemd/"
+          cp package/systemd/ai-trap.service      "${PKG}/systemd/"
+          cp package/systemd/camera-overlay.service "${PKG}/systemd/"
           cp package/install.sh      "${PKG}/"
           chmod +x "${PKG}/install.sh"
 
