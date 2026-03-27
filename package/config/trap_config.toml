@@ -52,9 +52,11 @@ max_missed     = 30         # frames before a lost track is deleted
 #                           # IMX708 Wide: /usr/share/libcamera/ipa/rpi/pisp/imx708_wide.json
 #                           # IMX477:      /usr/share/libcamera/ipa/rpi/pisp/imx477.json
 
-# IMX708 recommended mode — 2x2 binned, full FOV
-capture_width  = 2304
-capture_height = 1296
+# IMX708 1536x864 mode — full FOV, lower memory/bandwidth than 2304x1296.
+# 2304x1296 causes a kernel hard-reset on CM5 due to the 35 MB ncnn float mat
+# allocated per frame saturating memory bandwidth. 1536x864 is stable.
+capture_width  = 1536
+capture_height = 864
 framerate      = 30
 buffer_count   = 4
 

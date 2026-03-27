@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-#  install.sh — AI Trap installation script for Raspberry Pi 5 (aarch64)
+#  install.sh — AI Trap installation script (CM5 / Raspberry Pi 5, aarch64)
 #
-#  Usage:
+#  Target OS: Raspberry Pi OS or Debian Trixie 64-bit Lite
+#  Hardware:  Waveshare CM5-NANO-A (production) / CM5-IO-BASE-A (test)
+#
+#  Usage (run on the trap board):
 #    sudo ./install.sh
 #
-#  Installs to /opt/ai-trap and registers a systemd service.
+#  What this script does:
+#    1. Installs runtime prerequisites via apt
+#    2. Creates the ai-trap system user and /opt/ai-trap directory tree
+#    3. Copies the binary, model files, and default config
+#    4. Sets camera_auto_detect=0 in /boot/firmware/config.txt
+#    5. Installs and enables ai-trap.service
+#    6. Enables persistent systemd journal
+#
 #  An existing trap_config.toml is never overwritten.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -27,11 +37,50 @@ error() { echo -e "${RED}[ai-trap]${NC} $*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || error "Please run as root: sudo ./install.sh"
 
 ARCH=$(uname -m)
-[ "$ARCH" = "aarch64" ] || error "This package is for aarch64 (Raspberry Pi 5). Detected: $ARCH"
+[ "$ARCH" = "aarch64" ] || error "This package is for aarch64 (Raspberry Pi 5 / CM5). Detected: $ARCH"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "${SCRIPT_DIR}/bin/${BINARY_NAME}" ]    || error "Binary not found: ${SCRIPT_DIR}/bin/${BINARY_NAME}"
 [ -f "${SCRIPT_DIR}/systemd/${SERVICE_NAME}.service" ] || error "Service file not found"
+
+# ── Install runtime prerequisites ────────────────────────────────────────────
+# Required on a fresh Raspberry Pi OS / Debian Trixie Lite image.
+#
+# libcamera0.7   — libcamera runtime + transitive deps:
+#                  libpisp, libyuv, libboost, libgnutls, libEGL, liblttng, etc.
+# libcamera-ipa  — RPi IPA .so modules loaded at runtime by the IPA module path
+# libsqlite3-0   — SQLite3 runtime (database)
+# libgomp1       — OpenMP runtime (used by ncnn inference)
+
+info "Checking / installing runtime prerequisites..."
+apt-get update -qq
+
+# Install packages individually so one missing package does not silently
+# block the rest.  libcamera0.7 / libcamera-ipa are from the Raspberry Pi
+# apt repo (package 0.7.0+rptXXXX); libsqlite3-0 and libgomp1 come from
+# standard Debian.
+_apt_install() {
+    local pkg="$1"
+    if apt-get install -y --no-install-recommends "$pkg" 2>/dev/null; then
+        info "  installed: $pkg"
+    else
+        warn "  FAILED to install: $pkg — check apt sources and retry."
+    fi
+}
+
+_apt_install libcamera0.7
+_apt_install libcamera-ipa
+_apt_install libsqlite3-0
+_apt_install libgomp1
+
+# Verify the IPA modules are present — without them the binary causes a
+# kernel panic on CM5 due to the bundled IPA interacting badly with the
+# RP1 camera driver.
+if [ ! -d /usr/lib/aarch64-linux-gnu/libcamera ]; then
+    warn "libcamera IPA directory not found after install."
+    warn "The Raspberry Pi apt repo may not be configured on this image."
+    warn "Add it and re-run, or install libcamera0.7 + libcamera-ipa manually."
+fi
 
 # ── Create system user ────────────────────────────────────────────────────────
 
@@ -155,6 +204,46 @@ fi
 
 
 
+# ── Configure /boot/firmware/config.txt for CM5 camera ───────────────────────
+# The IMX708 overlay is loaded at runtime by camera-overlay.service — NOT at
+# boot via config.txt.  Loading it statically at boot causes a power spike that
+# crashes the RP1 camera driver on CM5 (board hard-resets in a reboot loop).
+# camera_auto_detect must be OFF to prevent the Pi firmware from auto-loading
+# a conflicting overlay.
+
+BOOT_CONFIG="/boot/firmware/config.txt"
+if [ -f "${BOOT_CONFIG}" ]; then
+    # Disable camera auto-detect
+    if grep -q "^camera_auto_detect=1" "${BOOT_CONFIG}"; then
+        info "Setting camera_auto_detect=0 in ${BOOT_CONFIG}..."
+        sed -i 's/^camera_auto_detect=1$/camera_auto_detect=0/' "${BOOT_CONFIG}"
+    elif ! grep -q "^camera_auto_detect=" "${BOOT_CONFIG}"; then
+        info "Adding camera_auto_detect=0 to ${BOOT_CONFIG}..."
+        if grep -q "^display_auto_detect" "${BOOT_CONFIG}"; then
+            sed -i '/^display_auto_detect/i camera_auto_detect=0' "${BOOT_CONFIG}"
+        else
+            echo "camera_auto_detect=0" >> "${BOOT_CONFIG}"
+        fi
+    else
+        info "camera_auto_detect already set correctly in ${BOOT_CONFIG}."
+    fi
+
+    # Remove any stale static dtoverlay=imx708 line — it causes a reboot loop on CM5
+    if grep -q "dtoverlay=imx708" "${BOOT_CONFIG}"; then
+        warn "Removing dtoverlay=imx708 from ${BOOT_CONFIG} (causes CM5 reboot loop)..."
+        sed -i '/dtoverlay=imx708/d' "${BOOT_CONFIG}"
+    fi
+else
+    warn "${BOOT_CONFIG} not found — ensure camera_auto_detect=0 is set."
+fi
+
+# ── Remove any stale SQLite WAL/lock files from a previous install ────────────
+# A crashed binary leaves behind -wal and -shm files that prevent SQLite from
+# opening the database in WAL mode on next start (SQLITE_PROTOCOL error).
+for f in "${INSTALL_DIR}"/*.db-wal "${INSTALL_DIR}"/*.db-shm; do
+    [ -e "$f" ] && { info "Removing stale lock file: $f"; rm -f "$f"; }
+done
+
 # ── Install systemd service ───────────────────────────────────────────────────
 
 info "Installing systemd services..."
@@ -211,5 +300,5 @@ info "API:     http://<pi-ip>:8080"
 info "Stream:  http://<pi-ip>:9000"
 info "BLE:     advertises as 'AI-Trap-<trap_id>' (requires wifi.managed=true)"
 info ""
-info "NOTE: camera-overlay.service loads dtoverlay=imx708 at runtime"
-info "after the network is online, avoiding boot-time power spikes."
+info "NOTE: camera-overlay.service loads dtoverlay imx708 at runtime (avoids CM5 boot crash)."
+info "A reboot is required."

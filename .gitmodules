@@ -1,3 +1,6 @@
 [submodule "api"]
 	path = api
 	url = https://github.com/nature-sense/ai-trap-api.git
+[submodule "subprojects/ncnn"]
+	path = subprojects/ncnn
+	url = https://github.com/Tencent/ncnn.git

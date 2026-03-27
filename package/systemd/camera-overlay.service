@@ -1,15 +1,16 @@
 [Unit]
 Description=Load IMX708 camera overlay at runtime
-After=network-online.target
-Wants=network-online.target
+# Load after basic system init — avoids boot-time power spike on CM5 that
+# crashes the RP1 camera driver when dtoverlay is applied via config.txt.
+After=sysinit.target
+Before=ai-trap.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStartPre=/bin/sleep 10
-ExecStartPre=/bin/sh -c 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo powersave > $f; done'
+ExecStartPre=/bin/sleep 5
 ExecStart=/usr/bin/dtoverlay imx708
-ExecStartPost=/bin/sh -c 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo ondemand > $f; done'
+SuccessExitStatus=0 1
 
 [Install]
 WantedBy=multi-user.target

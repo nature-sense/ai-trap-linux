@@ -147,8 +147,29 @@ if _cross_sysroot != ''
                       required : false)
   endif
 else
-  ncnn_dep    = dependency('ncnn',    required : true)
   sqlite3_dep = dependency('sqlite3', required : true)
+
+  ncnn_dep = dependency('ncnn', required : false)
+  if not ncnn_dep.found()
+    cmake = import('cmake')
+    ncnn_opts = cmake.subproject_options()
+    ncnn_opts.add_cmake_defines({
+      'NCNN_BUILD_EXAMPLES'  : 'OFF',
+      'NCNN_BUILD_TOOLS'     : 'OFF',
+      'NCNN_BUILD_BENCHMARK' : 'OFF',
+      'NCNN_VULKAN'          : 'OFF',
+    })
+    ncnn_proj = cmake.subproject('ncnn', options : ncnn_opts)
+    # NCNN's build tree exposes headers under src/ directly, but the
+    # codebase uses #include "ncnn/mat.h".  The generated meson.build
+    # adds '.' (the subproject root) to the include path, so a
+    # ncnn/ -> src/ symlink there makes both styles work.
+    run_command('ln', '-sfn',
+      meson.project_source_root() / 'subprojects/ncnn/src',
+      meson.project_source_root() / 'subprojects/ncnn/ncnn',
+      check : true)
+    ncnn_dep  = ncnn_proj.dependency('ncnn')
+  endif
 endif
 
 # Bluetooth headers — needed for BLE GATT server (Pi 5 and Luckfox).

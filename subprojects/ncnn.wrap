@@ -1,0 +1,4 @@
+[wrap-git]
+url      = https://github.com/Tencent/ncnn.git
+revision = 20240410
+depth    = 1
