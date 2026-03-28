@@ -34,6 +34,11 @@ codesign -s - ./upgrade_tool
 
 If a blocked-app dialog still appears: **System Settings → Privacy & Security → Open Anyway**.
 
+> **Critical: use a data-capable USB-C cable.** Charge-only cables have no data lines and the
+> board will be completely invisible to the Mac — nothing appears in System Profiler, no LED
+> in Maskrom mode, no error message. If the board doesn't appear, try a different cable first.
+> A cable that works for file transfer with a phone or USB drive is suitable.
+
 ### 0.3 Put the board into Maskrom mode
 
 1. With the board **unpowered** and USB cable **disconnected**, hold down the **BOOT** button
@@ -253,6 +258,7 @@ ssh root@<luckfox-ip> "/etc/init.d/S99trap start"
 | Symptom | Check |
 |---------|-------|
 | `ssh: connect to host 172.32.0.70 port 22: Connection refused` | Board not booted yet, or try `172.32.0.93` |
+| Board invisible in Maskrom mode — no LED, nothing in System Profiler | Cable is charge-only — replace with a data-capable cable |
 | USB Ethernet doesn't appear on Mac | Try a different USB-C cable (data cable, not charge-only) |
 | `/dev/video0` not found | Camera not detected — check V4L2 driver is loaded |
 | `ai-trap.log` shows model load error | Model files missing — check `/opt/trap/model.ncnn.*` |
