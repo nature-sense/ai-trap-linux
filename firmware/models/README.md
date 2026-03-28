@@ -1,39 +1,65 @@
 # models/
 
-Place model files here before building.
+Model files for the ai-trap firmware.
 
-## Available models
+## Source and generated files
 
-| Directory | Input size | Backend | Notes |
-|---|---|---|---|
-| `yolo11n-320/` | 320×320 | ncnn | Lightweight — recommended for Pi 5 real-time inference |
+| File | Type | Description |
+|------|------|-------------|
+| `yolo11n-320/model.pt` | **source** | Ultralytics yolo11n weights — commit this to trigger conversion |
+| `yolo11n-320/model.ncnn.param` | generated | ncnn architecture — used by the default CPU build |
+| `yolo11n-320/model.ncnn.bin` | generated | ncnn weights |
+| `yolo11n-320/model.onnx` | generated | intermediate — also used for local Mac RKNN conversion |
+| `yolo11n-320/model.rknn` | generated | RKNN INT8/fp16 — used by the `-Duse_rknn=true` NPU build |
 
-Each model directory contains two files:
+All generated files are committed to the repository so that firmware builds and
+deployments never require a local conversion step.
 
-| File | Description |
-|---|---|
-| `model.ncnn.param` | Network architecture (~50 KB) |
-| `model.ncnn.bin` | Weights (~5.6 MB) |
+## Automatic conversion (CI)
 
-## Config
+Pushing `model.pt` to `main` triggers the **Convert model** GitHub Actions workflow
+(`.github/workflows/convert-model.yml`).  The workflow:
 
-Model paths and input size are set in `trap_config.toml` (in the build directory):
+1. Exports `model.ncnn.param` + `model.ncnn.bin` via Ultralytics ncnn export
+2. Exports `model.onnx` via Ultralytics ONNX export
+3. Converts `model.onnx` → `model.rknn` via rknn-toolkit2
+4. Commits all outputs back to the repository with `[skip ci]`
 
-```toml
-[model]
-param       = "../firmware/models/yolo11n-320/model.ncnn.param"
-bin         = "../firmware/models/yolo11n-320/model.ncnn.bin"
-width       = 320
-height      = 320
-num_classes = 1
-format      = "anchor_grid"
+No Docker or local tooling is needed — the runner is native x86_64 Linux.
+
+### INT8 vs fp16 RKNN
+
+If `firmware/models/calibration/` contains JPEG or PNG images, the RKNN model is
+built with INT8 quantisation (better NPU throughput).  Without calibration images
+it falls back to fp16.
+
+To add calibration images:
+
+```bash
+mkdir -p firmware/models/calibration
+# Copy 50–200 representative JPEG frames from the trap camera
+cp /path/to/trap/crops/*.jpg firmware/models/calibration/
+git add firmware/models/calibration/
+git commit -m "feat: add INT8 calibration images"
+git push
 ```
 
-Paths are relative to the working directory the binary is run from,
-or use absolute paths for deployment.
+## Manual conversion on Mac
 
-## Adding a new model
+If you need to run the conversion locally (e.g. to test a new model before
+committing, or to produce an INT8 build with a large local calibration set):
 
-1. Create a subdirectory named `<modelname>-<size>/` (e.g. `yolo11n-640/`)
-2. Place `model.ncnn.param` and `model.ncnn.bin` inside it
-3. Update `trap_config.toml` with the new paths, width, height, and format
+```bash
+# INT8
+./scripts/convert-rknn.sh \
+    firmware/models/yolo11n-320/model.onnx \
+    firmware/models/yolo11n-320/model.rknn \
+    /path/to/calibration_images
+
+# fp16 (no images needed)
+./scripts/convert-rknn.sh \
+    firmware/models/yolo11n-320/model.onnx \
+    firmware/models/yolo11n-320/model.rknn
+```
+
+See `docs/luckfox-rknn-npu.md` for the full RKNN workflow.

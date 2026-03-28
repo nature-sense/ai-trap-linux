@@ -5,10 +5,9 @@ build-*/
 # Cross-compilation sysroot (built by scripts/build-luckfox-deps.sh)
 sysroot/
 
-# Model weights — .param and .bin are small enough to commit.
-# .rknn files are larger compiled outputs — regenerate from .onnx.
-models/*.rknn
-models/*.onnx
+# Model weights — source (.pt) and all converted outputs (.param/.bin/.onnx/.rknn) are committed.
+# Ultralytics ncnn export writes a temp directory next to the .pt — ignore it.
+*_ncnn_model/
 
 # Runtime outputs
 crops/
