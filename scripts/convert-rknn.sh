@@ -1,9 +1,10 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-#  convert-rknn.sh
+#  convert-rknn.sh  —  convert yolo11n ONNX → RKNN INT8 for the RV1106 NPU
 #
-#  Converts a yolo11n ONNX model to RKNN INT8 for the RV1106 NPU.
-#  Runs rknn-toolkit2 inside Docker (x86_64) — works on Mac (Intel or Apple Silicon).
+#  Runs inside Docker (x86_64).  Works on Mac Intel and Apple Silicon.
+#  Requires Docker Desktop.  First run builds the image (~5–10 min under
+#  QEMU on Apple Silicon; subsequent runs reuse the cached image).
 #
 #  Usage:
 #    ./scripts/convert-rknn.sh <model.onnx> <model.rknn> [calibration_dir]
@@ -11,19 +12,21 @@
 #  Arguments:
 #    model.onnx        yolo11n ONNX export (320×320, single-class)
 #    model.rknn        output path for the .rknn file
-#    calibration_dir   optional: directory of JPEG/PNG images for INT8 calibration
-#                      (50–200 representative images from the trap camera)
-#                      Omit for a fp16 build (slower on NPU, no images needed).
+#    calibration_dir   optional directory of JPEG/PNG images for INT8
+#                      quantisation (50–200 frames from the trap camera)
+#                      Omit for fp16 (slower on NPU, no images needed).
 #
 #  Examples:
 #    # INT8 (recommended):
-#    ./scripts/convert-rknn.sh firmware/models/yolo11n-320/model.onnx \
-#                               firmware/models/yolo11n-320/model.rknn \
-#                               /path/to/calibration_images
+#    ./scripts/convert-rknn.sh \
+#        firmware/models/yolo11n-320/model.onnx \
+#        firmware/models/yolo11n-320/model.rknn \
+#        /path/to/calibration_images
 #
-#    # fp16 (no calibration images):
-#    ./scripts/convert-rknn.sh firmware/models/yolo11n-320/model.onnx \
-#                               firmware/models/yolo11n-320/model.rknn
+#    # fp16 (no calibration needed):
+#    ./scripts/convert-rknn.sh \
+#        firmware/models/yolo11n-320/model.onnx \
+#        firmware/models/yolo11n-320/model.rknn
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -32,7 +35,7 @@ RKNN_FILE="${2:-}"
 CALIB_DIR="${3:-}"
 
 if [ -z "$ONNX_FILE" ] || [ -z "$RKNN_FILE" ]; then
-    echo "Usage: $0 <model.onnx> <model.rknn> [calibration_dir]" >&2
+    sed -n '3,30p' "$0" | grep '^#' | sed 's/^# \?//'
     exit 1
 fi
 
@@ -41,15 +44,30 @@ if [ ! -f "$ONNX_FILE" ]; then
     exit 1
 fi
 
-# Resolve to absolute paths for Docker volume mounts
+# Resolve absolute paths
 ONNX_ABS="$(cd "$(dirname "$ONNX_FILE")" && pwd)/$(basename "$ONNX_FILE")"
 RKNN_ABS="$(cd "$(dirname "$RKNN_FILE")" && pwd)/$(basename "$RKNN_FILE")"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+IMAGE="rknn-toolkit2:local"
+
+# ── Build image if not present ─────────────────────────────────────────────
+if ! docker image inspect "$IMAGE" &>/dev/null; then
+    echo "=== Building rknn-toolkit2 image (one-time, ~5–10 min on Apple Silicon) ==="
+    docker build \
+        --platform linux/amd64 \
+        -t "$IMAGE" \
+        -f "$REPO_ROOT/scripts/Dockerfile.rknn-toolkit2" \
+        "$REPO_ROOT"
+    echo "=== Image built and cached ==="
+    echo ""
+fi
+
+# ── Assemble docker run arguments ──────────────────────────────────────────
 DOCKER_ARGS=(
     --rm
     --platform linux/amd64
-    -v "$REPO_ROOT:/workspace"
+    -v "$REPO_ROOT:/workspace:ro"
     -v "$(dirname "$ONNX_ABS"):/models"
 )
 
@@ -69,33 +87,15 @@ if [ -n "$CALIB_DIR" ]; then
     CMD_ARGS+=(/calibration)
 fi
 
+# ── Run ───────────────────────────────────────────────────────────────────
 echo "=== RKNN conversion ==="
 echo "  ONNX : $ONNX_ABS"
 echo "  RKNN : $RKNN_ABS"
-[ -n "$CALIB_DIR" ] && echo "  calib: $CALIB_ABS (INT8)" || echo "  quant: none (fp16)"
+[ -n "$CALIB_DIR" ] \
+    && echo "  quant: INT8 (calibration: $CALIB_ABS)" \
+    || echo "  quant: fp16 (no calibration images)"
 echo ""
 
-# Build or reuse the toolkit image
-IMAGE="rknn-toolkit2:local"
-if ! docker image inspect "$IMAGE" &>/dev/null; then
-    echo "=== Building rknn-toolkit2 Docker image (first run, ~5 min) ==="
-    docker build --platform linux/amd64 -t "$IMAGE" - <<'DOCKERFILE'
-FROM python:3.10-slim
-RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends \
-        libgomp1 libglib2.0-0 libsm6 libxrender1 libxext6 && \
-    rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir \
-    rknn-toolkit2 \
-    onnx \
-    onnxruntime \
-    opencv-python-headless \
-    numpy
-DOCKERFILE
-    echo "=== Image built ==="
-fi
-
-echo "=== Running conversion ==="
 docker run "${DOCKER_ARGS[@]}" "$IMAGE" "${CMD_ARGS[@]}"
 
 echo ""
