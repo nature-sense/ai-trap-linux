@@ -168,14 +168,18 @@ public:
 
 private:
     // ── V4L2 state ────────────────────────────────────────────────────────────
-    int  m_fd     = -1;
-    int  m_width  = 0;
-    int  m_height = 0;
-    int  m_stride = 0;   // bytes per Y row reported by driver (>= width)
+    int      m_fd        = -1;
+    int      m_width     = 0;
+    int      m_height    = 0;
+    int      m_stride    = 0;        // bytes per Y row reported by driver (>= width)
+    bool     m_isMplane  = false;    // true = V4L2_CAP_VIDEO_CAPTURE_MPLANE
+    uint32_t m_numPlanes = 1;        // from pix_mp.num_planes after S_FMT
 
+    // Per-buffer mmap state.  In MPLANE mode each plane may have its own
+    // mapping; for NV12 on RV1106 num_planes is 1 so planes[1] is unused.
     struct MmapBuffer {
-        void*  start  = nullptr;
-        size_t length = 0;
+        void*  start[2]  = {nullptr, nullptr};
+        size_t length[2] = {0, 0};
     };
     std::vector<MmapBuffer> m_buffers;
 

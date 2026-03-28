@@ -76,7 +76,10 @@ void V4L2Capture::open(const V4L2Config& cfg) {
         throw std::runtime_error("V4L2Capture: VIDIOC_QUERYCAP failed: " +
                                  std::string(strerror(errno)));
 
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE))
+    const bool hasSingle = (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) != 0;
+    const bool hasMplane = (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) != 0;
+
+    if (!hasSingle && !hasMplane)
         throw std::runtime_error("V4L2Capture: " + cfg.device +
                                  " is not a video capture device");
 
@@ -84,35 +87,60 @@ void V4L2Capture::open(const V4L2Config& cfg) {
         throw std::runtime_error("V4L2Capture: " + cfg.device +
                                  " does not support streaming");
 
+    // Prefer single-plane; fall back to MPLANE (RV1106 rkisp is MPLANE-only)
+    m_isMplane = !hasSingle && hasMplane;
+    const v4l2_buf_type bufType = m_isMplane
+        ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+        : V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    printf("V4L2Capture: %s  mode=%s\n",
+           cfg.device.c_str(), m_isMplane ? "MPLANE" : "single-plane");
+
     // ── 3. Negotiate NV12 format ──────────────────────────────────────────────
     v4l2_format fmt{};
-    fmt.type                  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    fmt.fmt.pix.width         = static_cast<uint32_t>(cfg.captureWidth);
-    fmt.fmt.pix.height        = static_cast<uint32_t>(cfg.captureHeight);
-    fmt.fmt.pix.pixelformat   = V4L2_PIX_FMT_NV12;
-    fmt.fmt.pix.field         = V4L2_FIELD_NONE;
+    fmt.type = bufType;
+
+    if (m_isMplane) {
+        fmt.fmt.pix_mp.width       = static_cast<uint32_t>(cfg.captureWidth);
+        fmt.fmt.pix_mp.height      = static_cast<uint32_t>(cfg.captureHeight);
+        fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+        fmt.fmt.pix_mp.field       = V4L2_FIELD_NONE;
+    } else {
+        fmt.fmt.pix.width          = static_cast<uint32_t>(cfg.captureWidth);
+        fmt.fmt.pix.height         = static_cast<uint32_t>(cfg.captureHeight);
+        fmt.fmt.pix.pixelformat    = V4L2_PIX_FMT_NV12;
+        fmt.fmt.pix.field          = V4L2_FIELD_NONE;
+    }
 
     if (!xioctl(VIDIOC_S_FMT, &fmt))
         throw std::runtime_error("V4L2Capture: VIDIOC_S_FMT failed: " +
                                  std::string(strerror(errno)));
 
     // Driver may have adjusted resolution — accept it
-    m_width  = static_cast<int>(fmt.fmt.pix.width);
-    m_height = static_cast<int>(fmt.fmt.pix.height);
-    m_stride = static_cast<int>(fmt.fmt.pix.bytesperline);
+    if (m_isMplane) {
+        m_width      = static_cast<int>(fmt.fmt.pix_mp.width);
+        m_height     = static_cast<int>(fmt.fmt.pix_mp.height);
+        m_stride     = static_cast<int>(fmt.fmt.pix_mp.plane_fmt[0].bytesperline);
+        m_numPlanes  = fmt.fmt.pix_mp.num_planes;
+        if (fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_NV12)
+            throw std::runtime_error("V4L2Capture: driver did not accept NV12 format");
+    } else {
+        m_width  = static_cast<int>(fmt.fmt.pix.width);
+        m_height = static_cast<int>(fmt.fmt.pix.height);
+        m_stride = static_cast<int>(fmt.fmt.pix.bytesperline);
+        m_numPlanes = 1;
+        if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_NV12)
+            throw std::runtime_error("V4L2Capture: driver did not accept NV12 format");
+    }
 
-    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_NV12)
-        throw std::runtime_error("V4L2Capture: driver did not accept NV12 format");
-
-    printf("V4L2Capture: %s  %dx%d (requested %dx%d)  stride=%d  fmt=NV12\n",
-           cfg.device.c_str(),
+    printf("V4L2Capture: %dx%d (requested %dx%d)  stride=%d  planes=%u  fmt=NV12\n",
            m_width, m_height,
            cfg.captureWidth, cfg.captureHeight,
-           m_stride);
+           m_stride, m_numPlanes);
 
     // ── 4. Set framerate ──────────────────────────────────────────────────────
     v4l2_streamparm parm{};
-    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    parm.type = bufType;
     parm.parm.capture.timeperframe.numerator   = 1;
     parm.parm.capture.timeperframe.denominator = static_cast<uint32_t>(cfg.framerate);
 
@@ -130,7 +158,7 @@ void V4L2Capture::open(const V4L2Config& cfg) {
     // ── 5. Request MMAP buffers ───────────────────────────────────────────────
     v4l2_requestbuffers req{};
     req.count  = static_cast<uint32_t>(cfg.bufferCount);
-    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.type   = bufType;
     req.memory = V4L2_MEMORY_MMAP;
 
     if (!xioctl(VIDIOC_REQBUFS, &req))
@@ -145,24 +173,35 @@ void V4L2Capture::open(const V4L2Config& cfg) {
     // ── 6. mmap each buffer ───────────────────────────────────────────────────
     m_buffers.resize(req.count);
     for (uint32_t i = 0; i < req.count; i++) {
+        v4l2_plane planes[VIDEO_MAX_PLANES]{};
         v4l2_buffer buf{};
-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.type   = bufType;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index  = i;
+        if (m_isMplane) {
+            buf.m.planes = planes;
+            buf.length   = m_numPlanes;
+        }
 
         if (!xioctl(VIDIOC_QUERYBUF, &buf))
             throw std::runtime_error("V4L2Capture: VIDIOC_QUERYBUF failed: " +
                                      std::string(strerror(errno)));
 
-        m_buffers[i].length = buf.length;
-        m_buffers[i].start  = mmap(nullptr, buf.length,
-                                   PROT_READ | PROT_WRITE,
-                                   MAP_SHARED,
-                                   m_fd, buf.m.offset);
+        for (uint32_t p = 0; p < m_numPlanes; p++) {
+            size_t   len    = m_isMplane ? planes[p].length        : buf.length;
+            uint32_t offset = m_isMplane ? planes[p].m.mem_offset  : buf.m.offset;
 
-        if (m_buffers[i].start == MAP_FAILED)
-            throw std::runtime_error("V4L2Capture: mmap failed for buffer " +
-                                     std::to_string(i) + ": " + strerror(errno));
+            m_buffers[i].length[p] = len;
+            m_buffers[i].start[p]  = mmap(nullptr, len,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_SHARED,
+                                          m_fd, offset);
+
+            if (m_buffers[i].start[p] == MAP_FAILED)
+                throw std::runtime_error("V4L2Capture: mmap failed for buffer " +
+                                         std::to_string(i) + " plane " +
+                                         std::to_string(p) + ": " + strerror(errno));
+        }
     }
 }
 
@@ -174,19 +213,28 @@ void V4L2Capture::start() {
     if (!m_frameCb)
         throw std::runtime_error("V4L2Capture: setCallback() must be called before start()");
 
+    const v4l2_buf_type bufType = m_isMplane
+        ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+        : V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
     // Queue all buffers
     for (uint32_t i = 0; i < m_buffers.size(); i++) {
+        v4l2_plane planes[VIDEO_MAX_PLANES]{};
         v4l2_buffer buf{};
-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.type   = bufType;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index  = i;
+        if (m_isMplane) {
+            buf.m.planes = planes;
+            buf.length   = m_numPlanes;
+        }
         if (!xioctl(VIDIOC_QBUF, &buf))
             throw std::runtime_error("V4L2Capture: VIDIOC_QBUF failed: " +
                                      std::string(strerror(errno)));
     }
 
     // Start streaming
-    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    v4l2_buf_type type = bufType;
     if (!xioctl(VIDIOC_STREAMON, &type))
         throw std::runtime_error("V4L2Capture: VIDIOC_STREAMON failed: " +
                                  std::string(strerror(errno)));
@@ -212,13 +260,16 @@ void V4L2Capture::stop() {
     if (m_dispatchThread.joinable()) m_dispatchThread.join();
 
     // Stop streaming
-    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    v4l2_buf_type type = m_isMplane
+        ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+        : V4L2_BUF_TYPE_VIDEO_CAPTURE;
     xioctl(VIDIOC_STREAMOFF, &type);
 
     // Unmap buffers
     for (auto& buf : m_buffers)
-        if (buf.start && buf.start != MAP_FAILED)
-            munmap(buf.start, buf.length);
+        for (uint32_t p = 0; p < m_numPlanes; p++)
+            if (buf.start[p] && buf.start[p] != MAP_FAILED)
+                munmap(buf.start[p], buf.length[p]);
     m_buffers.clear();
 
     if (m_fd >= 0) {
@@ -257,9 +308,15 @@ void V4L2Capture::captureLoop() {
         if (r == 0) continue;  // timeout — loop and check m_shouldStop
 
         // Dequeue a filled buffer
+        v4l2_plane planes[VIDEO_MAX_PLANES]{};
         v4l2_buffer buf{};
-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.type   = m_isMplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
+                                : V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
+        if (m_isMplane) {
+            buf.m.planes = planes;
+            buf.length   = m_numPlanes;
+        }
 
         if (!xioctl(VIDIOC_DQBUF, &buf)) {
             if (errno == EAGAIN) continue;
@@ -276,31 +333,37 @@ void V4L2Capture::captureLoop() {
             static_cast<int64_t>(buf.timestamp.tv_usec) * 1'000LL;
 
         // ── De-stride NV12 into compact buffer ────────────────────────────────
-        // RV1103 RKISP: single contiguous buffer, Y at offset 0, UV at stride*H.
-        // Unlike Pi 5 PiSP there are no per-plane DMA fd offsets to worry about.
+        // Single-plane or MPLANE with num_planes=1: Y at offset 0, UV at S*H.
+        // MPLANE with num_planes=2: plane[0]=Y, plane[1]=UV (separate mmaps).
         const int W = m_width;
         const int H = m_height;
         const int S = m_stride;   // bytes per Y row (may be > W with padding)
 
-        const auto* src = static_cast<const uint8_t*>(m_buffers[buf.index].start);
+        const auto* yPlane  = static_cast<const uint8_t*>(m_buffers[buf.index].start[0]);
+        const auto* uvPlane = (m_numPlanes >= 2)
+            ? static_cast<const uint8_t*>(m_buffers[buf.index].start[1])
+            : yPlane + S * H;
 
         std::vector<uint8_t> nv12(static_cast<size_t>(W * H * 3 / 2));
 
         // De-stride Y rows
         for (int row = 0; row < H; row++)
             std::memcpy(nv12.data() + row * W,
-                        src          + row * S,
+                        yPlane       + row * S,
                         static_cast<size_t>(W));
 
-        // De-stride UV rows (UV plane starts at S*H in the driver buffer)
-        const uint8_t* uvSrc = src + S * H;
-        uint8_t*       uvDst = nv12.data() + W * H;
+        // De-stride UV rows
+        uint8_t* uvDst = nv12.data() + W * H;
         for (int row = 0; row < H / 2; row++)
-            std::memcpy(uvDst + row * W,
-                        uvSrc + row * S,
+            std::memcpy(uvDst   + row * W,
+                        uvPlane + row * S,
                         static_cast<size_t>(W));
 
         // Re-queue the buffer immediately so the ISP stays fed
+        if (m_isMplane) {
+            buf.m.planes = planes;   // planes[] is still valid in this scope
+            buf.length   = m_numPlanes;
+        }
         if (!xioctl(VIDIOC_QBUF, &buf))
             emitError("captureLoop: VIDIOC_QBUF error: " + std::string(strerror(errno)));
 
