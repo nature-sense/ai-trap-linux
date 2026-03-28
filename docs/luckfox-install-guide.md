@@ -253,13 +253,76 @@ ssh root@<luckfox-ip> "/etc/init.d/S99trap start"
 
 ---
 
+## USB networking on macOS — first-time setup
+
+The Luckfox presents a **RNDIS** USB network gadget. macOS has no native RNDIS driver so no
+USB network interface appears even though the board is detected. Use **ADB** to get initial
+access, then configure WiFi so you can SSH over your normal network.
+
+### Connect via ADB
+
+```bash
+brew install android-platform-tools
+adb devices                  # shows something like "0c71d25c71813677  device"
+adb shell                    # root shell, no password needed
+```
+
+### Configure WiFi from the ADB shell
+
+```bash
+# Check your router's SSID from scan results
+wpa_cli scan && sleep 3 && wpa_cli scan_results
+
+# Edit credentials (replace with your actual SSID and password)
+sed -i 's/ssid=".*"/ssid="YourSSID"/' /etc/wpa_supplicant.conf
+sed -i 's/psk=".*"/psk="YourPassword"/' /etc/wpa_supplicant.conf
+
+# Start wpa_supplicant
+killall wpa_supplicant 2>/dev/null
+rm -f /var/run/wpa_supplicant/wlan0
+wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf
+sleep 5
+wpa_cli status               # wpa_state should show COMPLETED
+
+# If ARP doesn't resolve on first try, reassociate
+wpa_cli reassociate && sleep 3
+
+# Get an IP
+udhcpc -i wlan0
+ip addr show wlan0           # note the assigned IP
+```
+
+### Make WiFi start on boot
+
+```bash
+cat >> /etc/network/interfaces << 'EOF'
+
+auto wlan0
+iface wlan0 inet dhcp
+    pre-up wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf
+    post-down killall wpa_supplicant
+EOF
+reboot
+```
+
+After reboot, SSH over WiFi using the IP shown above (or check your router's DHCP table).
+
+> **Note:** The Luckfox Pico Zero's AIC8800DC supports 2.4 GHz and 5 GHz, but the 2.4 GHz
+> band is more reliable with the stock firmware. If your router uses separate SSIDs per band,
+> use the 2.4 GHz SSID.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Check |
 |---------|-------|
 | `ssh: connect to host 172.32.0.70 port 22: Connection refused` | Board not booted yet, or try `172.32.0.93` |
 | Board invisible in Maskrom mode — no LED, nothing in System Profiler | Cable is charge-only — replace with a data-capable cable |
-| USB Ethernet doesn't appear on Mac | Try a different USB-C cable (data cable, not charge-only) |
+| No USB network interface on Mac after boot | RNDIS not supported natively — use ADB instead (see above) |
+| `adb devices` shows no device | Board not booted, or try a different USB port/cable |
+| `udhcpc` loops with no response | wpa_supplicant not associated — run `wpa_cli reassociate` then retry |
+| ARP incomplete, ping fails | Run `wpa_cli reassociate`, wait 3s, retry ping |
 | `/dev/video0` not found | Camera not detected — check V4L2 driver is loaded |
 | `ai-trap.log` shows model load error | Model files missing — check `/opt/trap/model.ncnn.*` |
 | WiFi AP not visible | `S50wifi` not running — check `ps | grep hostapd` |
