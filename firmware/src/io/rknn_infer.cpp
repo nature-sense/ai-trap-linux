@@ -90,6 +90,7 @@ bool RknnInference::init(const std::string& modelPath, int inputW, int inputH)
         return false;
     }
 
+    m_inputBuf.resize(static_cast<size_t>(m_inputH) * m_inputW * 3);
     m_outBuf.resize(static_cast<size_t>(m_outH) * m_outW);
 
     printf("[rknn] output tensor: n_dims=%u  shape=[", out_attr.n_dims);
@@ -110,14 +111,27 @@ bool RknnInference::infer(const float* inputCHW, ncnn::Mat& out)
 
     auto ctx = static_cast<rknn_context>(m_ctx);
 
-    // Set input — channel-planar float32 matches NCHW directly
+    // Convert float32 CHW [0,1] → uint8 HWC [0,255].
+    // The model was converted with mean=[0,0,0] std=[255,255,255], so RKNN
+    // applies ÷255 internally — uint8 NHWC is the expected runtime input.
+    {
+        const int pixels = m_inputH * m_inputW;
+        for (int c = 0; c < 3; ++c) {
+            const float* src = inputCHW + c * pixels;
+            for (int i = 0; i < pixels; ++i) {
+                float v = src[i] * 255.f;
+                m_inputBuf[i * 3 + c] =
+                    static_cast<uint8_t>(v < 0.f ? 0 : v > 255.f ? 255 : v);
+            }
+        }
+    }
+
     rknn_input inputs[1]{};
     inputs[0].index        = 0;
-    inputs[0].type         = RKNN_TENSOR_FLOAT32;
-    inputs[0].size         = static_cast<uint32_t>(
-                                 m_inputH * m_inputW * 3 * sizeof(float));
-    inputs[0].fmt          = RKNN_TENSOR_NCHW;
-    inputs[0].buf          = const_cast<float*>(inputCHW);
+    inputs[0].type         = RKNN_TENSOR_UINT8;
+    inputs[0].size         = static_cast<uint32_t>(m_inputH * m_inputW * 3);
+    inputs[0].fmt          = RKNN_TENSOR_NHWC;
+    inputs[0].buf          = m_inputBuf.data();
     inputs[0].pass_through = 0;
 
     int ret = rknn_inputs_set(ctx, 1, inputs);
@@ -164,5 +178,6 @@ void RknnInference::deinit()
         rknn_destroy(static_cast<rknn_context>(m_ctx));
         m_ctx = 0;
     }
+    m_inputBuf.clear();
     m_outBuf.clear();
 }

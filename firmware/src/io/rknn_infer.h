@@ -52,10 +52,11 @@ public:
     void deinit();
 
 private:
-    uint64_t           m_ctx    = 0;   // rknn_context (typedef uint64_t)
-    int                m_inputW = 0;
-    int                m_inputH = 0;
-    int                m_outW   = 0;   // ncnn Mat w (number of anchors)
-    int                m_outH   = 0;   // ncnn Mat h (4 + numClasses)
-    std::vector<float> m_outBuf;       // dequantised output, owned here
+    uint64_t              m_ctx      = 0;   // rknn_context (typedef uint64_t)
+    int                   m_inputW   = 0;
+    int                   m_inputH   = 0;
+    int                   m_outW     = 0;   // ncnn Mat w (number of anchors)
+    int                   m_outH     = 0;   // ncnn Mat h (4 + numClasses)
+    std::vector<uint8_t>  m_inputBuf;       // float32 CHW → uint8 HWC staging buffer
+    std::vector<float>    m_outBuf;         // dequantised output, owned here
 };
