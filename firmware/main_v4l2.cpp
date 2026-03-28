@@ -9,7 +9,12 @@
 #include "sync_manager.h"
 #include "wifi_manager.h"
 #include "epaper_display.h"
+
+#ifdef USE_RKNN
+#include "rknn_infer.h"
+#else
 #include "ncnn/net.h"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -38,27 +43,50 @@ static void onSignal(int) { g_stop = true; }
 // ─────────────────────────────────────────────────────────────────────────────
 //  main
 //
-//  Usage: ./yolo_v4l2 [param] [bin] [db] [crops-dir] [device]
-//    param      ncnn .param file      (default yolo11n.param)
-//    bin        ncnn .bin file        (default yolo11n.bin)
-//    db         SQLite output path    (default detections.db)
-//    crops-dir  directory for crops   (default crops)
-//    device     V4L2 device node      (default /dev/video0)
+//  ncnn build:
+//    Usage: ./yolo_v4l2 [param] [bin] [db] [crops-dir] [device]
+//      param      ncnn .param file      (default yolo11n.param)
+//      bin        ncnn .bin file        (default yolo11n.bin)
+//      db         SQLite output path    (default detections.db)
+//      crops-dir  directory for crops   (default crops)
+//      device     V4L2 device node      (default /dev/video0)
+//
+//  RKNN build (-DUSE_RKNN):
+//    Usage: ./yolo_v4l2 [model.rknn] [db] [crops-dir] [device]
+//      model.rknn  RKNN model file       (default model.rknn)
+//      db          SQLite output path    (default detections.db)
+//      crops-dir   directory for crops   (default crops)
+//      device      V4L2 device node      (default /dev/video0)
 // ─────────────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+#ifdef USE_RKNN
+    const char* rknnFile = argc > 1 ? argv[1] : "model.rknn";
+    const char* dbPath   = argc > 2 ? argv[2] : "detections.db";
+    const char* cropsDir = argc > 3 ? argv[3] : "crops";
+    const char* device   = argc > 4 ? argv[4] : "/dev/video0";
+#else
     const char* paramFile = argc > 1 ? argv[1] : "yolo11n.param";
     const char* binFile   = argc > 2 ? argv[2] : "yolo11n.bin";
     const char* dbPath    = argc > 3 ? argv[3] : "detections.db";
     const char* cropsDir  = argc > 4 ? argv[4] : "crops";
     const char* device    = argc > 5 ? argv[5] : "/dev/video0";
+#endif
 
     printf("══════════════════════════════════════════════════════════\n");
+#ifdef USE_RKNN
+    printf("  YOLO11n  Luckfox Pico Zero  IMX415 V4L2 + RKNN NPU + ByteTracker\n");
+    printf("══════════════════════════════════════════════════════════\n");
+    printf("  model  : %s\n  db     : %s\n"
+           "  crops  : %s\n  device : %s\n\n",
+           rknnFile, dbPath, cropsDir, device);
+#else
     printf("  YOLO11n  Luckfox Pico Zero  IMX415 V4L2 + ncnn + ByteTracker\n");
     printf("══════════════════════════════════════════════════════════\n");
     printf("  model  : %s / %s\n  db     : %s\n"
            "  crops  : %s\n  device : %s\n\n",
            paramFile, binFile, dbPath, cropsDir, device);
+#endif
 
     std::signal(SIGINT,  onSignal);
     std::signal(SIGTERM, onSignal);
@@ -175,6 +203,15 @@ int main(int argc, char* argv[]) {
         // non-fatal — continue without REST API
     }
 
+#ifdef USE_RKNN
+    // ── RKNN model ────────────────────────────────────────────────────────────
+    RknnInference net;
+    if (!net.init(rknnFile, decCfg.modelWidth, decCfg.modelHeight)) {
+        db.close();
+        return 1;
+    }
+    printf("RKNN model loaded: %s\n\n", rknnFile);
+#else
     // ── ncnn model ────────────────────────────────────────────────────────────
     ncnn::Net net;
     net.opt.num_threads         = 4;
@@ -235,6 +272,7 @@ int main(int argc, char* argv[]) {
         printf("Input layer:  \"%s\"\n", inputName.c_str());
         printf("Output layer: \"%s\"\n\n", outputName.c_str());
     }
+#endif
 
     // ── V4L2Capture — Luckfox IMX415-98 IR-CUT Camera ────────────────────────
     //
@@ -271,14 +309,22 @@ int main(int argc, char* argv[]) {
     cam.setCallback([&](const CaptureFrame& frame) {
 
         // Inference
-        ncnn::Extractor ex = net.create_extractor();
-        ex.input(inputName.c_str(), frame.modelInput);
-
         ncnn::Mat output;
-        if (ex.extract(outputName.c_str(), output) != 0) {
-            fprintf(stderr, "[warn] extract() failed\n");
+#ifdef USE_RKNN
+        if (!net.infer(static_cast<const float*>(frame.modelInput.data), output)) {
+            fprintf(stderr, "[warn] rknn infer failed\n");
             return;
         }
+#else
+        {
+            ncnn::Extractor ex = net.create_extractor();
+            ex.input(inputName.c_str(), frame.modelInput);
+            if (ex.extract(outputName.c_str(), output) != 0) {
+                fprintf(stderr, "[warn] extract() failed\n");
+                return;
+            }
+        }
+#endif
 
         // Decode
         std::vector<Detection> dets = decoder.decode(

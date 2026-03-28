@@ -167,7 +167,6 @@ void WifiManager::applyStartupMode() {
         if (!err.empty()) {
             fprintf(stderr, "[wifi] station connect failed: %s — falling back to AP\n",
                     err.c_str());
-            clearCreds();
             switchToAP();
         }
     } else {

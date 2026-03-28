@@ -131,6 +131,8 @@ if not libcamera_dep.found()
   libcamera_dep = dependency('camera', required : false)
 endif
 
+use_rknn = get_option('use_rknn')
+
 if _cross_sysroot != ''
   _lib      = _cross_sysroot + '/usr/lib'
   _lib_arch = _cross_sysroot + '/usr/lib/aarch64-linux-gnu'
@@ -145,6 +147,13 @@ if _cross_sysroot != ''
     libcamera_dep = cxx.find_library('camera',
                       dirs     : [_lib_arch, _lib],
                       required : false)
+  endif
+
+  # RKNN NPU runtime — only needed for the Luckfox RKNN build.
+  # librknnrt.so ships with the Luckfox SDK; install it to $SYSROOT/usr/lib.
+  # rknn_api.h goes to $SYSROOT/usr/include (already on the -isystem path).
+  if use_rknn
+    rknn_dep = cxx.find_library('rknnrt', dirs : [_lib], required : true)
   endif
 else
   sqlite3_dep = dependency('sqlite3', required : true)
@@ -233,13 +242,23 @@ endif
 # ── Luckfox Pico Zero / IMX415 / V4L2 target ─────────────────────────────────
 
 if target_opt == 'v4l2' or target_opt == 'all'
+  v4l2_sources = shared_sources + files(
+    'firmware/src/io/v4l2_capture.cpp',
+    'firmware/main_v4l2.cpp',
+  )
+  v4l2_cpp_args = ['-DWIFI_BACKEND_HOSTAPD']
+  v4l2_deps     = shared_deps
+
+  if use_rknn
+    v4l2_sources  += files('firmware/src/io/rknn_infer.cpp')
+    v4l2_cpp_args += ['-DUSE_RKNN']
+    v4l2_deps     += [rknn_dep]
+  endif
+
   executable('yolo_v4l2',
-    sources : shared_sources + files(
-      'firmware/src/io/v4l2_capture.cpp',
-      'firmware/main_v4l2.cpp',
-    ),
+    sources             : v4l2_sources,
     include_directories : inc,
-    dependencies        : shared_deps,
-    cpp_args            : ['-DWIFI_BACKEND_HOSTAPD'],
+    dependencies        : v4l2_deps,
+    cpp_args            : v4l2_cpp_args,
   )
 endif

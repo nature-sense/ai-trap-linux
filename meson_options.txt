@@ -16,3 +16,9 @@ option('pi5_sysroot',
   value   : '',
   description : 'Path to sysroot with cross-compiled NCNN/SQLite3 for Raspberry Pi 5 (aarch64). libcamera is expected at the standard multiarch path (/usr/lib/aarch64-linux-gnu). Leave empty to use system pkg-config discovery.'
 )
+
+option('use_rknn',
+  type    : 'boolean',
+  value   : false,
+  description : 'Replace ncnn inference with the Rockchip RKNN NPU runtime (librknnrt). Requires rknn_api.h and librknnrt.so in the Luckfox sysroot. Only valid with -Dtarget=v4l2.'
+)
