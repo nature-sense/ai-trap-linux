@@ -9,6 +9,87 @@ GitHub Actions, then deploy it to the board over USB or WiFi.
 
 ---
 
+## 0. Flash the OS image (first-time setup)
+
+Skip this section if the board already has a working OS image.
+
+### 0.1 Download the OS image and flashing tool
+
+Go to the Luckfox downloads page:
+**https://wiki.luckfox.com/Luckfox-Pico-RV1106/Downloads/**
+
+From the Google Drive folder, download:
+- The latest `Luckfox_Pico_Zero_EMMC_YYMMDD.img` image file
+- The `upgrade_tool_v2.44_mac` folder — pick the binary matching your macOS version
+
+### 0.2 Unblock the upgrade_tool binary
+
+`upgrade_tool` is unsigned and macOS Gatekeeper will block it. Run these once before first use:
+
+```bash
+cd upgrade_tool_v2.44_mac
+xattr -d com.apple.quarantine ./upgrade_tool
+codesign -s - ./upgrade_tool
+```
+
+If a blocked-app dialog still appears: **System Settings → Privacy & Security → Open Anyway**.
+
+### 0.3 Put the board into Maskrom mode
+
+1. With the board **unpowered** and USB cable **disconnected**, hold down the **BOOT** button
+2. While holding BOOT, plug the USB-C cable into the board and connect to your Mac
+3. Hold BOOT for 1–2 seconds after connecting, then release
+
+Verify the board is detected:
+
+```bash
+system_profiler SPUSBDataType | grep -A5 "Rockchip\|2207"
+```
+
+A device with Vendor ID `0x2207` should appear. If not, try a different USB port —
+USB 3.x ports on some Macs cause detection failures; a USB 2.0 port or hub is more reliable.
+
+### 0.4 Flash the image
+
+```bash
+sudo ./upgrade_tool uf /path/to/Luckfox_Pico_Zero_EMMC_YYMMDD.img
+```
+
+Expected output on success:
+```
+Download Boot Success
+Download IDB Success
+Download Firmware Success
+Upgrade firmware ok.
+```
+
+The board reboots automatically after flashing.
+
+### 0.5 Verify boot
+
+After flashing, the board presents a USB network interface. SSH in:
+
+```bash
+ssh root@172.32.0.93
+```
+
+Default credentials: `root` with no password (blank). If you get a shell prompt, the flash succeeded.
+
+> **Fallback — rkdeveloptool (if upgrade_tool fails):**
+> ```bash
+> brew tap IgorKha/homebrew-rkdeveloptool
+> brew install rkdeveloptool
+> sudo rkdeveloptool ld                           # confirm MaskRom detected
+> sudo rkdeveloptool db rv1106_loader.bin          # loader .bin from same Google Drive folder
+> sudo rkdeveloptool wl 0 Luckfox_Pico_Zero_EMMC_YYMMDD.img
+> ```
+
+> **Fallback — browser WebUSB tool (no install needed):**
+> Open **https://asadmemon.com/rkdeveloptool/** in Chrome with the board in Maskrom mode.
+> Tested on RV1106 Luckfox boards.
+
+---
+
 ## 1. Get the binary
 
 ### Option A — Download from GitHub Actions (recommended)
