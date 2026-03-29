@@ -4,3 +4,6 @@
 [submodule "subprojects/ncnn"]
 	path = subprojects/ncnn
 	url = https://github.com/Tencent/ncnn.git
+[submodule "firmware/models"]
+	path = firmware/models
+	url = https://github.com/nature-sense/ai-trap-models.git
