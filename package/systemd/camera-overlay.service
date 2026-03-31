@@ -2,13 +2,12 @@
 Description=Load IMX708 camera overlay at runtime
 # Load after basic system init — avoids boot-time power spike on CM5 that
 # crashes the RP1 camera driver when dtoverlay is applied via config.txt.
-After=sysinit.target
+After=network-online.target
 Before=ai-trap.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStartPre=/bin/sleep 5
 ExecStart=/usr/bin/dtoverlay imx708
 SuccessExitStatus=0 1
 

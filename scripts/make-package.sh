@@ -123,11 +123,11 @@ else
     fail "Overlay:   camera-overlay.service missing 'dtoverlay imx708'"
 fi
 
-# Service file must not depend on camera-overlay (regression guard)
+# Service file must declare camera-overlay dependency (regression guard)
 if grep -q "camera-overlay" "${PKG_DIR}/systemd/ai-trap.service" 2>/dev/null; then
-    fail "Service:   ai-trap.service still references camera-overlay"
+    pass "Service:   ai-trap.service has camera-overlay dependency"
 else
-    pass "Service:   no camera-overlay dependency"
+    fail "Service:   ai-trap.service missing camera-overlay dependency"
 fi
 
 # StartLimitIntervalSec must be in [Unit] not [Service] — systemd on Trixie ignores it in [Service]
