@@ -1,9 +1,6 @@
 #!/bin/sh
 # install.sh  —  Deploy ai-trap to a Luckfox Pico Zero (run on the device)
 #
-# Copies the binary, model files, and init scripts.
-# Run as root from the directory containing this script.
-#
 # Usage:
 #   scp -r package/luckfox root@<luckfox-ip>:/tmp/ai-trap-install
 #   ssh root@<luckfox-ip> "sh /tmp/ai-trap-install/install.sh"
@@ -14,13 +11,15 @@ INSTALL_DIR=/opt/trap
 INIT_D=/etc/init.d
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "=== ai-trap Luckfox installation ==="
+echo "=== ai-trap Luckfox installation (RKNN NPU) ==="
 
 # ── Create install directory ──────────────────────────────────────────────────
+
 mkdir -p "$INSTALL_DIR/crops"
 echo "Install dir: $INSTALL_DIR"
 
-# ── Binary ───────────────────────────────────────────────────────────────────
+# ── Binary ────────────────────────────────────────────────────────────────────
+
 if [ -f "$SCRIPT_DIR/yolo_v4l2" ]; then
     cp "$SCRIPT_DIR/yolo_v4l2" "$INSTALL_DIR/yolo_v4l2"
     chmod +x "$INSTALL_DIR/yolo_v4l2"
@@ -29,38 +28,64 @@ else
     echo "WARNING: yolo_v4l2 not found in $SCRIPT_DIR — copy it manually"
 fi
 
-# ── Model files ───────────────────────────────────────────────────────────────
-for f in model.ncnn.param model.ncnn.bin; do
-    if [ -f "$SCRIPT_DIR/$f" ]; then
-        cp "$SCRIPT_DIR/$f" "$INSTALL_DIR/$f"
-        echo "Installed: $f"
+# ── RKNN model ────────────────────────────────────────────────────────────────
+
+if [ -f "$SCRIPT_DIR/model.rknn" ]; then
+    cp "$SCRIPT_DIR/model.rknn" "$INSTALL_DIR/model.rknn"
+    echo "Installed: model.rknn"
+else
+    echo "WARNING: model.rknn not found — copy it to $INSTALL_DIR manually"
+fi
+
+# ── RKNN runtime library ──────────────────────────────────────────────────────
+
+if [ -f "$SCRIPT_DIR/librknnmrt.so" ]; then
+    cp "$SCRIPT_DIR/librknnmrt.so" "$INSTALL_DIR/librknnmrt.so"
+    echo "Installed: librknnmrt.so"
+else
+    # Check if the library is already present on the system (Buildroot rootfs)
+    if [ -f /usr/lib/librknnmrt.so ] || [ -f /lib/librknnmrt.so ]; then
+        echo "librknnmrt.so already present on system"
     else
-        echo "WARNING: $f not found — copy model files to $INSTALL_DIR manually"
+        echo "WARNING: librknnmrt.so not found — RKNN inference will fail at runtime"
+        echo "         Deploy using: bash scripts/luckfox-install.sh (handles this automatically)"
     fi
-done
+fi
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+if [ -f "$SCRIPT_DIR/trap_config.toml" ]; then
+    cp "$SCRIPT_DIR/trap_config.toml" "$INSTALL_DIR/trap_config.toml"
+    echo "Installed: trap_config.toml"
+fi
 
 # ── WiFi init script ─────────────────────────────────────────────────────────
+
 cp "$SCRIPT_DIR/S50wifi" "$INIT_D/S50wifi"
 chmod +x "$INIT_D/S50wifi"
 echo "Installed: $INIT_D/S50wifi"
 
 # ── Trap service init script ─────────────────────────────────────────────────
+
 cat > "$INIT_D/S99trap" << 'EOF'
 #!/bin/sh
-# /etc/init.d/S99trap — start ai-trap after WiFi is up
+# /etc/init.d/S99trap — ai-trap RKNN NPU build
 
 INSTALL_DIR=/opt/trap
 BINARY=$INSTALL_DIR/yolo_v4l2
 LOGFILE=/var/log/ai-trap.log
 PIDFILE=/var/run/ai-trap.pid
 
+# RKNN runtime is in /opt/trap — add to dynamic linker search path
+export LD_LIBRARY_PATH=/opt/trap${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
 case "$1" in
   start)
-    echo "Starting ai-trap..."
+    echo "Starting ai-trap (RKNN NPU)..."
+    cd "$INSTALL_DIR"
     start-stop-daemon -S -b -m -p "$PIDFILE" \
         --exec "$BINARY" -- \
-        "$INSTALL_DIR/model.ncnn.param" \
-        "$INSTALL_DIR/model.ncnn.bin" \
+        "$INSTALL_DIR/model.rknn" \
         "$INSTALL_DIR/detections.db" \
         "$INSTALL_DIR/crops" \
         /dev/video0 \
@@ -75,13 +100,22 @@ case "$1" in
   restart)
     "$0" stop; sleep 1; "$0" start
     ;;
+  status)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+        echo "ai-trap is running (PID=$(cat $PIDFILE))"
+    else
+        echo "ai-trap is not running"
+        exit 1
+    fi
+    ;;
   *)
-    echo "Usage: $0 {start|stop|restart}"
+    echo "Usage: $0 {start|stop|restart|status}"
     exit 1
     ;;
 esac
 exit 0
 EOF
+
 chmod +x "$INIT_D/S99trap"
 echo "Installed: $INIT_D/S99trap"
 

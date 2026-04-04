@@ -131,14 +131,12 @@ if not libcamera_dep.found()
   libcamera_dep = dependency('camera', required : false)
 endif
 
-use_rknn = get_option('use_rknn')
-
 if _cross_sysroot != ''
   _lib      = _cross_sysroot + '/usr/lib'
   _lib_arch = _cross_sysroot + '/usr/lib/aarch64-linux-gnu'
 
-  ncnn_dep    = cxx.find_library('ncnn',    dirs : [_lib],             required : true)
-  sqlite3_dep = cxx.find_library('sqlite3', dirs : [_lib],             required : true)
+  ncnn_dep    = cxx.find_library('ncnn',    dirs : [_lib], required : true)
+  sqlite3_dep = cxx.find_library('sqlite3', dirs : [_lib], required : true)
 
   # libcamera: if pkg-config already found it (e.g. via the sysroot
   # pkg-config wrapper) keep that result.  Only fall back to find_library
@@ -149,11 +147,12 @@ if _cross_sysroot != ''
                       required : false)
   endif
 
-  # RKNN NPU runtime — only needed for the Luckfox RKNN build.
-  # librknnrt.so ships with the Luckfox SDK; install it to $SYSROOT/usr/lib.
-  # rknn_api.h goes to $SYSROOT/usr/include (already on the -isystem path).
-  if use_rknn
-    rknn_dep = cxx.find_library('rknnrt', dirs : [_lib], required : true)
+  # RKNN NPU mini-runtime — Luckfox v4l2 target only.
+  # librknnmrt.so and rknn_api.h are fetched from the Luckfox SDK by
+  # build-luckfox-mac.sh and installed to $SYSROOT/usr/lib and usr/include.
+  # RV1106 uses the mini-runtime (librknnmrt), not the full librknnrt.
+  if is_arm_cross
+    rknn_dep = cxx.find_library('rknnmrt', dirs : [_lib], required : true)
   endif
 else
   sqlite3_dep = dependency('sqlite3', required : true)
@@ -240,25 +239,20 @@ if target_opt == 'libcamera' or target_opt == 'all'
 endif
 
 # ── Luckfox Pico Zero / IMX415 / V4L2 target ─────────────────────────────────
+#
+# RKNN NPU inference is the only supported backend for the Luckfox target.
+# ncnn is retained as a library dependency because ncnn::Mat is used as the
+# shared tensor transport type throughout the capture and decoder pipeline.
 
 if target_opt == 'v4l2' or target_opt == 'all'
-  v4l2_sources = shared_sources + files(
-    'firmware/src/io/v4l2_capture.cpp',
-    'firmware/main_v4l2.cpp',
-  )
-  v4l2_cpp_args = ['-DWIFI_BACKEND_HOSTAPD']
-  v4l2_deps     = shared_deps
-
-  if use_rknn
-    v4l2_sources  += files('firmware/src/io/rknn_infer.cpp')
-    v4l2_cpp_args += ['-DUSE_RKNN']
-    v4l2_deps     += [rknn_dep]
-  endif
-
   executable('yolo_v4l2',
-    sources             : v4l2_sources,
+    sources : shared_sources + files(
+      'firmware/src/io/v4l2_capture.cpp',
+      'firmware/src/io/rknn_infer.cpp',
+      'firmware/main_v4l2.cpp',
+    ),
     include_directories : inc,
-    dependencies        : v4l2_deps,
-    cpp_args            : v4l2_cpp_args,
+    dependencies        : shared_deps + [rknn_dep],
+    cpp_args            : ['-DWIFI_BACKEND_HOSTAPD'],
   )
 endif
