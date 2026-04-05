@@ -193,27 +193,82 @@ INSTALL_DIR=/opt/trap
 BINARY=$INSTALL_DIR/yolo_v4l2
 LOGFILE=/var/log/ai-trap.log
 PIDFILE=/var/run/ai-trap.pid
+RKAIQ_PIDFILE=/var/run/rkaiq_3A_server.pid
+IQFILES=/etc/iqfiles
 
 # RKNN runtime is in /opt/trap — add to dynamic linker search path
 export LD_LIBRARY_PATH=/opt/trap${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
+start_isp() {
+    # Ensure IQ files are accessible at the path rkaiq_3A_server expects
+    [ -e "$IQFILES" ] || ln -sf /oem/usr/share/iqfiles "$IQFILES"
+
+    if [ -f "$RKAIQ_PIDFILE" ] && kill -0 "$(cat $RKAIQ_PIDFILE)" 2>/dev/null; then
+        echo "rkaiq_3A_server already running (PID=$(cat $RKAIQ_PIDFILE))"
+        return 0
+    fi
+
+    if command -v rkaiq_3A_server >/dev/null 2>&1; then
+        echo "Starting rkaiq_3A_server (ISP AWB/AE/AF)..."
+        rkaiq_3A_server >> "$LOGFILE" 2>&1 &
+        echo $! > "$RKAIQ_PIDFILE"
+        # Give the 3A server time to initialise the ISP before capture starts
+        sleep 2
+    else
+        echo "WARNING: rkaiq_3A_server not found — ISP will run without AWB/CCM"
+    fi
+}
+
+stop_isp() {
+    if [ -f "$RKAIQ_PIDFILE" ]; then
+        PID="$(cat "$RKAIQ_PIDFILE")"
+        kill "$PID" 2>/dev/null
+        rm -f "$RKAIQ_PIDFILE"
+    fi
+    killall rkaiq_3A_server 2>/dev/null || true
+}
+
 case "$1" in
   start)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+        echo "ai-trap is already running (PID=$(cat $PIDFILE))"
+        exit 0
+    fi
+    start_isp
     echo "Starting ai-trap (RKNN NPU)..."
     cd "$INSTALL_DIR"
-    start-stop-daemon -S -b -m -p "$PIDFILE" \
-        --exec "$BINARY" -- \
+    "$BINARY" \
         "$INSTALL_DIR/model.rknn" \
         "$INSTALL_DIR/detections.db" \
         "$INSTALL_DIR/crops" \
-        /dev/video0 \
-        >> "$LOGFILE" 2>&1
-    echo "ai-trap started (PID=$(cat $PIDFILE 2>/dev/null))"
+        /dev/video11 \
+        >> "$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    echo "ai-trap started (PID=$!)"
     ;;
   stop)
     echo "Stopping ai-trap..."
-    start-stop-daemon -K -p "$PIDFILE" --exec "$BINARY" 2>/dev/null || true
-    rm -f "$PIDFILE"
+    if [ -f "$PIDFILE" ]; then
+        PID="$(cat "$PIDFILE")"
+        if kill "$PID" 2>/dev/null; then
+            echo "stopped $BINARY (pid $PID)"
+            rm -f "$PIDFILE"
+        else
+            if killall yolo_v4l2 2>/dev/null; then
+                echo "stopped $BINARY (by name)"
+            else
+                echo "no $BINARY found; none killed"
+            fi
+            rm -f "$PIDFILE"
+        fi
+    else
+        if killall yolo_v4l2 2>/dev/null; then
+            echo "stopped $BINARY (no pidfile, killed by name)"
+        else
+            echo "no $BINARY found; none killed"
+        fi
+    fi
+    stop_isp
     ;;
   restart)
     "$0" stop; sleep 1; "$0" start
