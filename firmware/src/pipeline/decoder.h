@@ -24,8 +24,13 @@ struct Detection {
 //                scores > 1.0 → Format A (raw logits); ≤ 1.0 → Format B.
 //  AnchorGrid  — force Format A (YOLO11 default ncnn export)
 //  EndToEnd    — force Format B (NMS baked into model)
+//  DFL         — RKNN stripped-DFL format (RV1106 NPU)
+//                h = 4*reg_max + nc (e.g. 65 for single-class, reg_max=16)
+//                rows 0..4*reg_max-1  : raw DFL regression logits
+//                rows 4*reg_max..end  : sigmoid class scores (pre-applied)
+//                C++ decoder performs softmax-weighted-sum + anchor grid decode.
 // ─────────────────────────────────────────────────────────────────────────────
-enum class YoloFormat { Auto, AnchorGrid, EndToEnd };
+enum class YoloFormat { Auto, AnchorGrid, EndToEnd, DFL };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DecoderConfig
@@ -104,6 +109,12 @@ private:
         int srcW, int srcH, float scale, int padLeft, int padTop) const;
 
     std::vector<Detection> decodeEndToEnd(
+        const ncnn::Mat& out,
+        int srcW, int srcH, float scale, int padLeft, int padTop) const;
+
+    // RKNN stripped-DFL format (RV1106): raw DFL logits + pre-sigmoid class scores.
+    // h = 4*reg_max + numClasses,  w = numAnchors.
+    std::vector<Detection> decodeDFL(
         const ncnn::Mat& out,
         int srcW, int srcH, float scale, int padLeft, int padTop) const;
 

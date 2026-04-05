@@ -87,22 +87,35 @@ std::vector<Detection> YoloDecoder::dispatch(
         return decodeAnchorGrid(out, srcW, srcH, scale, padLeft, padTop);
     if (m_cfg.format == YoloFormat::EndToEnd)
         return decodeEndToEnd(out, srcW, srcH, scale, padLeft, padTop);
+    if (m_cfg.format == YoloFormat::DFL)
+        return decodeDFL(out, srcW, srcH, scale, padLeft, padTop);
 
     // ── Auto-detection ────────────────────────────────────────────────────────
     // Format B minor dimension: 5 for single-class, 6+ for multi-class.
-    const int fmtB = 4 + m_cfg.numClasses + (m_cfg.numClasses > 1 ? 1 : 0);
+    const int fmtB   = 4 + m_cfg.numClasses + (m_cfg.numClasses > 1 ? 1 : 0);
+    const int fmtDFL = 4 * 16 + m_cfg.numClasses;   // reg_max=16
 
-    const bool couldBeB = (out.w == fmtB || out.h == fmtB);
-    const bool couldBeA = (out.h == 4 + m_cfg.numClasses);
+    const bool couldBeB   = (out.w == fmtB || out.h == fmtB);
+    const bool couldBeA   = (out.h == 4 + m_cfg.numClasses);
+    const bool couldBeDFL = (out.h == fmtDFL);
+
+    // DFL tensor is unambiguous (h=65 for single-class vs h=5 for AnchorGrid).
+    if (couldBeDFL && !couldBeA && !couldBeB) {
+        static bool printed = false;
+        if (!printed) { printf("YoloDecoder: Format DFL (auto)\n"); printed = true; }
+        return decodeDFL(out, srcW, srcH, scale, padLeft, padTop);
+    }
 
     if (!couldBeB && !couldBeA) {
         fprintf(stderr,
             "YoloDecoder: unrecognised tensor  dims=%d  w=%d  h=%d\n"
             "  Expected Format A: h=%d (4+%d classes), w=~anchors\n"
             "  Expected Format B: minor dim=%d\n"
+            "  Expected Format DFL: h=%d (4*16+%d classes), w=~anchors\n"
             "  Set DecoderConfig::format to force a path.\n",
             out.dims, out.w, out.h,
-            4 + m_cfg.numClasses, m_cfg.numClasses, fmtB);
+            4 + m_cfg.numClasses, m_cfg.numClasses, fmtB,
+            fmtDFL, m_cfg.numClasses);
         return {};
     }
 
@@ -280,6 +293,134 @@ std::vector<Detection> YoloDecoder::decodeEndToEnd(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  decodeDFL  — RKNN stripped-DFL format (RV1106 NPU)
+//
+//  Tensor layout (dims=2, h=4*reg_max+nc, w=numAnchors):
+//    rows 0 .. 4*reg_max-1  : raw DFL regression logits  (reg_max=16)
+//    rows 4*reg_max .. end  : sigmoid class scores (pre-applied by model)
+//
+//  For anchor i at grid cell (gx, gy) with stride s:
+//    anchor_cx = (gx + 0.5) * s,  anchor_cy = (gy + 0.5) * s
+//    For direction d in {0:l, 1:t, 2:r, 3:b}:
+//      dist_d = dfl_dist(logits[d*reg_max .. (d+1)*reg_max - 1, i]) * s
+//    x1 = cx - l,  y1 = cy - t,  x2 = cx + r,  y2 = cy + b
+//
+//  Anchor grid (strides [8,16,32], modelW×modelH → grids filled row-major):
+//    stride 8  → gw=modelW/8,  gh=modelH/8   (40×40=1600 for 320)
+//    stride 16 → gw=modelW/16, gh=modelH/16  (20×20= 400 for 320)
+//    stride 32 → gw=modelW/32, gh=modelH/32  (10×10= 100 for 320)
+//
+//  NMS applied after decoding.
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::vector<Detection> YoloDecoder::decodeDFL(
+    const ncnn::Mat& out,
+    int srcW, int srcH, float scale, int padLeft, int padTop) const
+{
+    static constexpr int reg_max = 16;
+
+    const int numAnchors = out.w;
+    const int numClasses = m_cfg.numClasses;
+    const int modelW     = m_cfg.modelWidth;
+    const int modelH     = m_cfg.modelHeight;
+
+    const int expectedH = 4 * reg_max + numClasses;
+    if (out.h != expectedH) {
+        fprintf(stderr,
+            "YoloDecoder::decodeDFL: h=%d but expected %d (4×%d+%d classes)\n",
+            out.h, expectedH, reg_max, numClasses);
+        return {};
+    }
+
+    // ── Build anchor grid ──────────────────────────────────────────────────────
+    struct AnchorInfo { float cx, cy; int stride; };
+    std::vector<AnchorInfo> anchors;
+    anchors.reserve(static_cast<size_t>(numAnchors));
+
+    for (int s : { 8, 16, 32 }) {
+        const int gw = modelW / s;
+        const int gh = modelH / s;
+        for (int gy = 0; gy < gh; ++gy)
+            for (int gx = 0; gx < gw; ++gx)
+                anchors.push_back({ (gx + 0.5f) * s, (gy + 0.5f) * s, s });
+    }
+
+    if (static_cast<int>(anchors.size()) != numAnchors) {
+        fprintf(stderr,
+            "YoloDecoder::decodeDFL: built %d anchors but tensor w=%d\n"
+            "  Check DecoderConfig::modelWidth/modelHeight match the model.\n",
+            (int)anchors.size(), numAnchors);
+        return {};
+    }
+
+    // ── DFL softmax-weighted-sum ───────────────────────────────────────────────
+    // dist = sum_k( softmax(logits)[k] * k )  — numerically stable (subtract max)
+    auto dfl_dist = [](const float* logits) -> float {
+        float max_v = logits[0];
+        for (int k = 1; k < reg_max; ++k)
+            if (logits[k] > max_v) max_v = logits[k];
+        float sum = 0.f, weighted = 0.f;
+        for (int k = 0; k < reg_max; ++k) {
+            float e = std::exp(logits[k] - max_v);
+            sum      += e;
+            weighted += e * static_cast<float>(k);
+        }
+        return weighted / sum;
+    };
+
+    // ── Decode anchors ─────────────────────────────────────────────────────────
+    std::vector<Detection> dets;
+    dets.reserve(256);
+
+    for (int i = 0; i < numAnchors; ++i) {
+        // Class scores are pre-sigmoid'd by the model
+        float bestScore = m_cfg.confThresh;
+        int   bestCls   = -1;
+        for (int c = 0; c < numClasses; ++c) {
+            float s = out.row(4 * reg_max + c)[i];
+            if (s > bestScore) { bestScore = s; bestCls = c; }
+        }
+        if (bestCls < 0) continue;
+
+        // DFL decode
+        const AnchorInfo& a  = anchors[static_cast<size_t>(i)];
+        const float       sf = static_cast<float>(a.stride);
+
+        float logits_buf[4][reg_max];
+        for (int d = 0; d < 4; ++d)
+            for (int k = 0; k < reg_max; ++k)
+                logits_buf[d][k] = out.row(d * reg_max + k)[i];
+
+        const float l = dfl_dist(logits_buf[0]) * sf;
+        const float t = dfl_dist(logits_buf[1]) * sf;
+        const float r = dfl_dist(logits_buf[2]) * sf;
+        const float b = dfl_dist(logits_buf[3]) * sf;
+
+        const float x1 = clampf(unpad(a.cx - l, padLeft, scale), 0.f, (float)srcW);
+        const float y1 = clampf(unpad(a.cy - t, padTop,  scale), 0.f, (float)srcH);
+        const float x2 = clampf(unpad(a.cx + r, padLeft, scale), 0.f, (float)srcW);
+        const float y2 = clampf(unpad(a.cy + b, padTop,  scale), 0.f, (float)srcH);
+
+        if (x2 - x1 < 1.f || y2 - y1 < 1.f) continue;
+
+        // Box sanity filters
+        {
+            float w = x2 - x1, h = y2 - y1;
+            if (w < m_cfg.minBoxWidth)  continue;
+            if (h < m_cfg.minBoxHeight) continue;
+            float ar = (w > h) ? (w / h) : (h / w);
+            if (ar > m_cfg.maxAspectRatio) continue;
+            float frameArea = static_cast<float>(srcW) * static_cast<float>(srcH);
+            if ((w * h) / frameArea > m_cfg.maxBoxAreaRatio) continue;
+        }
+
+        dets.push_back({ x1, y1, x2, y2, bestScore, bestCls });
+    }
+
+    return nms(std::move(dets));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  nms  — per-class non-maximum suppression (Format A only)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -317,11 +458,14 @@ void YoloDecoder::debugTensor(const ncnn::Mat& out, int maxRows) const {
            out.dims, out.w, out.h, out.c, out.elemsize);
 
     const int  fmtB     = 4 + m_cfg.numClasses + (m_cfg.numClasses > 1 ? 1 : 0);
-    const bool couldBeB = (out.w == fmtB || out.h == fmtB);
-    const bool couldBeA = (out.h == 4 + m_cfg.numClasses);
+    const int  fmtDFL   = 4 * 16 + m_cfg.numClasses;
+    const bool couldBeB   = (out.w == fmtB || out.h == fmtB);
+    const bool couldBeA   = (out.h == 4 + m_cfg.numClasses);
+    const bool couldBeDFL = (out.h == fmtDFL);
 
-    printf("  numClasses=%d  fmtB_minor=%d  couldBeA=%d  couldBeB=%d\n",
-           m_cfg.numClasses, fmtB, couldBeA, couldBeB);
+    printf("  numClasses=%d  fmtB_minor=%d  fmtDFL_h=%d  "
+           "couldBeA=%d  couldBeB=%d  couldBeDFL=%d\n",
+           m_cfg.numClasses, fmtB, fmtDFL, couldBeA, couldBeB, couldBeDFL);
 
     // Print raw rows
     printf("  Raw rows (first %d):\n", maxRows);

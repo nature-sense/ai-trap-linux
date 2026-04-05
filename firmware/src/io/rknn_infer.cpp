@@ -2,101 +2,185 @@
 
 #include <rknn_api.h>
 
-#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <vector>
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-static std::vector<uint8_t> loadFile(const std::string& path)
-{
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) return {};
-    auto size = f.tellg();
-    f.seekg(0);
-    std::vector<uint8_t> buf(static_cast<size_t>(size));
-    f.read(reinterpret_cast<char*>(buf.data()), size);
-    return buf;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  init
+//  init  — loads the model file and defers rknn_init to the inference thread.
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool RknnInference::init(const std::string& modelPath, int inputW, int inputH)
 {
-    m_inputW = inputW;
-    m_inputH = inputH;
+    m_inputW    = inputW;
+    m_inputH    = inputH;
+    m_modelPath = modelPath;
 
-    // Load model bytes
-    auto model = loadFile(modelPath);
-    if (model.empty()) {
+    std::ifstream f(modelPath, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
         fprintf(stderr, "[rknn] cannot read model: %s\n", modelPath.c_str());
         return false;
     }
+    auto size = f.tellg();
+    f.seekg(0);
+    m_modelBytes.resize(static_cast<size_t>(size));
+    f.read(reinterpret_cast<char*>(m_modelBytes.data()), size);
+    if (!f) {
+        fprintf(stderr, "[rknn] read error: %s\n", modelPath.c_str());
+        return false;
+    }
 
-    // Initialise RKNN context
+    fprintf(stderr, "[rknn] model loaded: %s (%lld bytes) — NPU context deferred\n",
+            modelPath.c_str(), (long long)size);
+    m_readyToInit = true;
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  lazyInitCtx  — called on first infer() in the inference thread.
+//
+//  Uses the ZERO-COPY DMA API required by librknnmrt on RV1106/RV1103.
+//  rknn_inputs_set / rknn_outputs_get are NOT supported by the mini runtime;
+//  they always return -5 "context config invalid".
+//  Correct pattern: rknn_create_mem + rknn_set_io_mem (allocated once here),
+//  then write/read virt_addr per frame.
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool RknnInference::lazyInitCtx()
+{
     rknn_context ctx = 0;
-    int ret = rknn_init(&ctx, model.data(), static_cast<uint32_t>(model.size()),
+    int ret = rknn_init(&ctx,
+                        static_cast<void*>(m_modelBytes.data()),
+                        static_cast<uint32_t>(m_modelBytes.size()),
                         0, nullptr);
     if (ret < 0) {
         fprintf(stderr, "[rknn] rknn_init failed: %d\n", ret);
         return false;
     }
-    m_ctx = static_cast<uint64_t>(ctx);
+    m_ctx         = static_cast<uint64_t>(ctx);
+    m_readyToInit = false;
 
-    // Query number of inputs/outputs
+    // Log runtime / driver version
+    rknn_sdk_version sdk{};
+    if (rknn_query(ctx, RKNN_QUERY_SDK_VERSION, &sdk, sizeof(sdk)) == 0)
+        fprintf(stderr, "[rknn] SDK %s  driver %s\n", sdk.api_version, sdk.drv_version);
+
+    // Query tensor counts
     rknn_input_output_num io_num{};
     ret = rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
     if (ret < 0) {
-        fprintf(stderr, "[rknn] rknn_query IN_OUT_NUM failed: %d\n", ret);
-        rknn_destroy(ctx);
-        m_ctx = 0;
-        return false;
+        fprintf(stderr, "[rknn] IN_OUT_NUM query failed: %d\n", ret);
+        rknn_destroy(ctx); m_ctx = 0; return false;
     }
-    printf("[rknn] model inputs=%u  outputs=%u\n", io_num.n_input, io_num.n_output);
+    fprintf(stderr, "[rknn] model: %u input(s), %u output(s)\n",
+            io_num.n_input, io_num.n_output);
 
-    // Query output tensor shape (index 0)
+    // ── Input tensor ─────────────────────────────────────────────────────────
+    rknn_tensor_attr in_attr{};
+    in_attr.index = 0;
+    ret = rknn_query(ctx, RKNN_QUERY_INPUT_ATTR, &in_attr, sizeof(in_attr));
+    if (ret < 0) {
+        fprintf(stderr, "[rknn] INPUT_ATTR query failed: %d\n", ret);
+        rknn_destroy(ctx); m_ctx = 0; return false;
+    }
+    fprintf(stderr, "[rknn] input[0]: type=%d fmt=%d dims=[",
+            (int)in_attr.type, (int)in_attr.fmt);
+    for (uint32_t i = 0; i < in_attr.n_dims; ++i)
+        fprintf(stderr, "%u%s", in_attr.dims[i], i + 1 < in_attr.n_dims ? "," : "");
+    fprintf(stderr, "] size=%u size_with_stride=%u w_stride=%u\n",
+            in_attr.size, in_attr.size_with_stride, in_attr.w_stride);
+
+    // Override type to UINT8 NHWC — the model was converted with mean=[0,0,0]
+    // std=[255,255,255] so the NPU expects uint8 values in [0,255].
+    in_attr.type = RKNN_TENSOR_UINT8;
+    in_attr.fmt  = RKNN_TENSOR_NHWC;
+
+    m_inStride = (in_attr.w_stride > 0) ? (int)in_attr.w_stride : m_inputW;
+
+    // Allocate DMA input buffer and bind it to the input tensor.
+    uint32_t in_mem_sz = (in_attr.size_with_stride > 0)
+                         ? in_attr.size_with_stride
+                         : static_cast<uint32_t>(m_inputH * m_inStride * 3);
+    m_inputMem = rknn_create_mem(ctx, in_mem_sz);
+    if (!m_inputMem) {
+        fprintf(stderr, "[rknn] rknn_create_mem (input) failed\n");
+        rknn_destroy(ctx); m_ctx = 0; return false;
+    }
+    ret = rknn_set_io_mem(ctx, m_inputMem, &in_attr);
+    if (ret < 0) {
+        fprintf(stderr, "[rknn] rknn_set_io_mem (input) failed: %d\n", ret);
+        rknn_destroy_mem(ctx, m_inputMem); m_inputMem = nullptr;
+        rknn_destroy(ctx); m_ctx = 0; return false;
+    }
+    fprintf(stderr, "[rknn] input DMA mem: virt=%p size=%u\n",
+            m_inputMem->virt_addr, in_mem_sz);
+
+    // ── Output tensor ────────────────────────────────────────────────────────
+    // Use NATIVE_NHWC_OUTPUT_ATTR — the correct query for RV1106 mini runtime.
     rknn_tensor_attr out_attr{};
     out_attr.index = 0;
-    ret = rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &out_attr, sizeof(out_attr));
+    ret = rknn_query(ctx, RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR, &out_attr, sizeof(out_attr));
     if (ret < 0) {
-        fprintf(stderr, "[rknn] rknn_query OUTPUT_ATTR failed: %d\n", ret);
-        rknn_destroy(ctx);
-        m_ctx = 0;
-        return false;
+        // Fallback to standard OUTPUT_ATTR if native query unsupported
+        fprintf(stderr, "[rknn] NATIVE_NHWC_OUTPUT_ATTR failed (%d), trying OUTPUT_ATTR\n", ret);
+        out_attr.index = 0;
+        ret = rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &out_attr, sizeof(out_attr));
+        if (ret < 0) {
+            fprintf(stderr, "[rknn] OUTPUT_ATTR query failed: %d\n", ret);
+            rknn_destroy_mem(ctx, m_inputMem); m_inputMem = nullptr;
+            rknn_destroy(ctx); m_ctx = 0; return false;
+        }
     }
+    fprintf(stderr, "[rknn] output[0]: type=%d fmt=%d dims=[",
+            (int)out_attr.type, (int)out_attr.fmt);
+    for (uint32_t i = 0; i < out_attr.n_dims; ++i)
+        fprintf(stderr, "%u%s", out_attr.dims[i], i + 1 < out_attr.n_dims ? "," : "");
+    fprintf(stderr, "] size=%u size_with_stride=%u scale=%.6f zp=%d\n",
+            out_attr.size, out_attr.size_with_stride, out_attr.scale, (int)out_attr.zp);
 
     // Map tensor dims to (h, w) for ncnn::Mat(w, h).
     // Expected shapes after RKNN conversion of yolo11n:
-    //   3D: [1, 5, 2100]  →  squeeze batch  →  h=5,  w=2100
-    //   2D: [5, 2100]                        →  h=5,  w=2100
-    // dims[] is in NCHW order; n_dims gives the count.
+    //   3D: [1, 5, 2100]  →  h=5,  w=2100
+    //   2D: [5, 2100]     →  h=5,  w=2100
     if (out_attr.n_dims == 3) {
-        // [batch, h, w] — batch should be 1
         m_outH = static_cast<int>(out_attr.dims[1]);
         m_outW = static_cast<int>(out_attr.dims[2]);
     } else if (out_attr.n_dims == 2) {
         m_outH = static_cast<int>(out_attr.dims[0]);
         m_outW = static_cast<int>(out_attr.dims[1]);
     } else {
-        fprintf(stderr, "[rknn] unexpected output tensor dims=%u\n", out_attr.n_dims);
-        rknn_destroy(ctx);
-        m_ctx = 0;
-        return false;
+        fprintf(stderr, "[rknn] unexpected output dims=%u\n", out_attr.n_dims);
+        rknn_destroy_mem(ctx, m_inputMem); m_inputMem = nullptr;
+        rknn_destroy(ctx); m_ctx = 0; return false;
     }
 
-    m_inputBuf.resize(static_cast<size_t>(m_inputH) * m_inputW * 3);
-    m_outBuf.resize(static_cast<size_t>(m_outH) * m_outW);
+    m_outElems = static_cast<uint32_t>(m_outH) * m_outW;
+    m_outScale = out_attr.scale;
+    m_outZp    = out_attr.zp;
+    m_outBuf.resize(m_outElems);
 
-    printf("[rknn] output tensor: n_dims=%u  shape=[", out_attr.n_dims);
-    for (uint32_t i = 0; i < out_attr.n_dims; ++i)
-        printf("%u%s", out_attr.dims[i], i + 1 < out_attr.n_dims ? "," : "");
-    printf("]  → ncnn::Mat(%d, %d)\n", m_outW, m_outH);
+    // Allocate DMA output buffer and bind it.
+    uint32_t out_mem_sz = (out_attr.size_with_stride > 0)
+                          ? out_attr.size_with_stride
+                          : static_cast<uint32_t>(m_outElems);  // INT8 = 1 byte/elem
+    m_outputMem = rknn_create_mem(ctx, out_mem_sz);
+    if (!m_outputMem) {
+        fprintf(stderr, "[rknn] rknn_create_mem (output) failed\n");
+        rknn_destroy_mem(ctx, m_inputMem); m_inputMem = nullptr;
+        rknn_destroy(ctx); m_ctx = 0; return false;
+    }
+    ret = rknn_set_io_mem(ctx, m_outputMem, &out_attr);
+    if (ret < 0) {
+        fprintf(stderr, "[rknn] rknn_set_io_mem (output) failed: %d\n", ret);
+        rknn_destroy_mem(ctx, m_outputMem); m_outputMem = nullptr;
+        rknn_destroy_mem(ctx, m_inputMem);  m_inputMem  = nullptr;
+        rknn_destroy(ctx); m_ctx = 0; return false;
+    }
+    fprintf(stderr, "[rknn] output DMA mem: virt=%p size=%u\n",
+            m_outputMem->virt_addr, out_mem_sz);
+    fprintf(stderr, "[rknn] ready — output ncnn::Mat(%d, %d)  scale=%.6f zp=%d\n",
+            m_outW, m_outH, m_outScale, m_outZp);
 
     return true;
 }
@@ -107,64 +191,52 @@ bool RknnInference::init(const std::string& modelPath, int inputW, int inputH)
 
 bool RknnInference::infer(const float* inputCHW, ncnn::Mat& out)
 {
-    if (!m_ctx) return false;
+    if (!m_ctx && m_readyToInit) {
+        if (!lazyInitCtx()) return false;
+    }
+    if (!m_ctx || !m_inputMem || !m_outputMem) return false;
 
     auto ctx = static_cast<rknn_context>(m_ctx);
 
-    // Convert float32 CHW [0,1] → uint8 HWC [0,255].
-    // The model was converted with mean=[0,0,0] std=[255,255,255], so RKNN
-    // applies ÷255 internally — uint8 NHWC is the expected runtime input.
+    // Convert float32 CHW [0,1] → uint8 HWC [0,255] directly into DMA buffer.
+    // If w_stride > inputW, pad each row to the stride boundary (zero-filled
+    // by rknn_create_mem, so only write the active pixels).
     {
-        const int pixels = m_inputH * m_inputW;
-        for (int c = 0; c < 3; ++c) {
-            const float* src = inputCHW + c * pixels;
-            for (int i = 0; i < pixels; ++i) {
-                float v = src[i] * 255.f;
-                m_inputBuf[i * 3 + c] =
-                    static_cast<uint8_t>(v < 0.f ? 0 : v > 255.f ? 255 : v);
+        auto* dst     = static_cast<uint8_t*>(m_inputMem->virt_addr);
+        const int pix = m_inputH * m_inputW;
+        const int stride3 = m_inStride * 3;      // bytes per row in DMA buffer
+        const int width3  = m_inputW  * 3;       // bytes per row of active data
+
+        for (int h = 0; h < m_inputH; ++h) {
+            uint8_t* row = dst + h * stride3;
+            for (int w = 0; w < m_inputW; ++w) {
+                for (int c = 0; c < 3; ++c) {
+                    float v = inputCHW[c * pix + h * m_inputW + w] * 255.f;
+                    row[w * 3 + c] = static_cast<uint8_t>(
+                        v < 0.f ? 0 : v > 255.f ? 255 : static_cast<int>(v));
+                }
             }
+            (void)width3;  // used implicitly in loop above
         }
     }
 
-    rknn_input inputs[1]{};
-    inputs[0].index        = 0;
-    inputs[0].type         = RKNN_TENSOR_UINT8;
-    inputs[0].size         = static_cast<uint32_t>(m_inputH * m_inputW * 3);
-    inputs[0].fmt          = RKNN_TENSOR_NHWC;
-    inputs[0].buf          = m_inputBuf.data();
-    inputs[0].pass_through = 0;
-
-    int ret = rknn_inputs_set(ctx, 1, inputs);
-    if (ret < 0) {
-        fprintf(stderr, "[rknn] rknn_inputs_set failed: %d\n", ret);
-        return false;
-    }
-
-    ret = rknn_run(ctx, nullptr);
+    int ret = rknn_run(ctx, nullptr);
     if (ret < 0) {
         fprintf(stderr, "[rknn] rknn_run failed: %d\n", ret);
         return false;
     }
 
-    // Retrieve dequantised float32 output
-    rknn_output outputs[1]{};
-    outputs[0].index      = 0;
-    outputs[0].want_float = 1;
-
-    ret = rknn_outputs_get(ctx, 1, outputs, nullptr);
-    if (ret < 0) {
-        fprintf(stderr, "[rknn] rknn_outputs_get failed: %d\n", ret);
-        return false;
+    // Dequantize INT8 output → float32.
+    // Affine: float = (int8 - zp) * scale
+    {
+        const auto* src = static_cast<const int8_t*>(m_outputMem->virt_addr);
+        const float  sc  = m_outScale;
+        const int32_t zp = m_outZp;
+        for (uint32_t i = 0; i < m_outElems; ++i)
+            m_outBuf[i] = (static_cast<int32_t>(src[i]) - zp) * sc;
     }
 
-    memcpy(m_outBuf.data(), outputs[0].buf,
-           m_outBuf.size() * sizeof(float));
-
-    rknn_outputs_release(ctx, 1, outputs);
-
-    // Wrap in ncnn::Mat — external data, no ownership transfer
-    out = ncnn::Mat(m_outW, m_outH, static_cast<void*>(m_outBuf.data()),
-                    sizeof(float));
+    out = ncnn::Mat(m_outW, m_outH, static_cast<void*>(m_outBuf.data()), sizeof(float));
     return true;
 }
 
@@ -175,9 +247,12 @@ bool RknnInference::infer(const float* inputCHW, ncnn::Mat& out)
 void RknnInference::deinit()
 {
     if (m_ctx) {
-        rknn_destroy(static_cast<rknn_context>(m_ctx));
+        auto ctx = static_cast<rknn_context>(m_ctx);
+        if (m_outputMem) { rknn_destroy_mem(ctx, m_outputMem); m_outputMem = nullptr; }
+        if (m_inputMem)  { rknn_destroy_mem(ctx, m_inputMem);  m_inputMem  = nullptr; }
+        rknn_destroy(ctx);
         m_ctx = 0;
     }
-    m_inputBuf.clear();
     m_outBuf.clear();
+    m_modelBytes.clear();
 }
