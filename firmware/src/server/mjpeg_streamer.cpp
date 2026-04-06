@@ -39,7 +39,7 @@ MjpegStreamer::~MjpegStreamer() {
 void MjpegStreamer::open(const MjpegStreamerConfig& cfg) {
     m_cfg = cfg;
 
-    m_serverFd = ::socket(AF_INET, SOCK_STREAM, 0);
+    m_serverFd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (m_serverFd < 0)
         throw std::runtime_error(
             std::string("MjpegStreamer: socket() failed: ") + strerror(errno));
@@ -158,8 +158,9 @@ void MjpegStreamer::acceptLoop() {
         sockaddr_in clientAddr{};
         socklen_t   len = sizeof(clientAddr);
 
-        int fd = ::accept(m_serverFd,
-                          reinterpret_cast<sockaddr*>(&clientAddr), &len);
+        int fd = ::accept4(m_serverFd,
+                           reinterpret_cast<sockaddr*>(&clientAddr), &len,
+                           SOCK_CLOEXEC);
         if (fd < 0) {
             if (!m_shouldStop.load())
                 perror("MjpegStreamer: accept");
@@ -260,6 +261,24 @@ std::vector<uint8_t> MjpegStreamer::encodeFrame(
     // NEON-optimised on ARM.
     std::vector<uint8_t> rgb(static_cast<size_t>(srcW * srcH * 3));
     ncnn::yuv420sp2rgb_nv12(nv12.data(), srcW, srcH, rgb.data());
+
+    // ── 1b. Software white-balance correction ──────────────────────────────────
+    // The ISP runs without rkaiq AWB/CCM on RV1106, so the raw NV12 has a strong
+    // green bias (Bayer GBRG sensor response).  Apply per-channel gains to restore
+    // approximate neutral grey.  Gains empirically measured from a white target:
+    //   R ×1.80,  G ×1.00,  B ×1.55
+    // Clamped to [0,255].  Applied only to the stream JPEG, not to model input.
+    {
+        const float kR = 1.80f, kG = 1.00f, kB = 1.55f;
+        uint8_t* p = rgb.data();
+        const uint8_t* end = p + static_cast<size_t>(srcW * srcH * 3);
+        while (p < end) {
+            float r = p[0] * kR; p[0] = r > 255.f ? 255 : static_cast<uint8_t>(r);
+            float g = p[1] * kG; p[1] = g > 255.f ? 255 : static_cast<uint8_t>(g);
+            float b = p[2] * kB; p[2] = b > 255.f ? 255 : static_cast<uint8_t>(b);
+            p += 3;
+        }
+    }
 
     // ── 2. Scale to stream resolution ─────────────────────────────────────────
     std::vector<uint8_t> scaled = scaleRgb(rgb.data(), srcW, srcH,
