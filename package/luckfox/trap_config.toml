@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  trap_config.toml  —  AI Trap production configuration (Luckfox Pico Zero)
+#
+#  Installed to /opt/trap/trap_config.toml on the device.
+#  Configure trap.id and trap.location via the REST API after first boot:
+#    POST http://<trap-ip>:8080/api/config
+# ─────────────────────────────────────────────────────────────────────────────
+
+[trap]
+id       = "trap_001"   # update via POST /api/config after installation
+location = ""
+
+[model]
+param       = "/opt/trap/model.ncnn.param"
+bin         = "/opt/trap/model.ncnn.bin"
+width       = 320
+height      = 320
+num_classes = 1
+format               = "anchor_grid"
+pre_applied_sigmoid  = true
+
+[detection]
+conf_threshold    = 0.45
+nms_threshold     = 0.45
+min_box_width     = 20
+min_box_height    = 20
+max_aspect_ratio  = 5.0
+max_box_area_ratio = 0.15
+
+[tracker]
+high_threshold = 0.50
+low_threshold  = 0.20
+iou_threshold  = 0.30
+min_hits       = 3
+max_missed     = 30
+
+[camera]
+# V4L2 capture — IMX415 on Luckfox Pico Zero
+framerate    = 30
+buffer_count = 4
+
+[crops]
+output_dir           = "/opt/trap/crops"
+jpeg_quality         = 90
+min_confidence       = 0.50
+min_confidence_delta = 0.05
+max_saves_per_track  = 3
+max_queue_depth      = 16
+
+[stream]
+port         = 9000
+width        = 640
+height       = 480
+jpeg_quality = 75
+
+[sse]
+port            = 8081
+max_clients     = 8
+max_queue_depth = 64
+
+[api]
+port = 8080
+
+[database]
+path = "/opt/trap/detections.db"
+
+[wifi]
+# managed = true  → S50wifi handles AP/station switching via REST API
+# managed = false → WiFi managed by OS (development only)
+managed     = true
+ap_password = "aiwildlife"
+iface       = "wlan0"
+creds_path  = "/opt/trap/wifi_creds.conf"
+
+[display]
+enabled = false

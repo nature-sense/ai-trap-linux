@@ -1,0 +1,69 @@
+#!/bin/sh
+# /etc/init.d/S99trap — ai-trap RKNN NPU build
+
+INSTALL_DIR=/opt/trap
+BINARY=$INSTALL_DIR/yolo_v4l2
+LOGFILE=/var/log/ai-trap.log
+PIDFILE=/var/run/ai-trap.pid
+
+# RKNN runtime is in /opt/trap — add to dynamic linker search path
+export LD_LIBRARY_PATH=/opt/trap${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
+case "$1" in
+  start)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+        echo "ai-trap is already running (PID=$(cat $PIDFILE))"
+        exit 0
+    fi
+    echo "Starting ai-trap (RKNN NPU)..."
+    cd "$INSTALL_DIR"
+    "$BINARY" \
+        "$INSTALL_DIR/model.rknn" \
+        "$INSTALL_DIR/detections.db" \
+        "$INSTALL_DIR/crops" \
+        /dev/video11 \
+        >> "$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    echo "ai-trap started (PID=$!)"
+    ;;
+  stop)
+    echo "Stopping ai-trap..."
+    if [ -f "$PIDFILE" ]; then
+        PID="$(cat "$PIDFILE")"
+        if kill "$PID" 2>/dev/null; then
+            echo "stopped $BINARY (pid $PID)"
+            rm -f "$PIDFILE"
+        else
+            # pidfile stale — kill by name as fallback
+            if killall yolo_v4l2 2>/dev/null; then
+                echo "stopped $BINARY (by name)"
+            else
+                echo "no $BINARY found; none killed"
+            fi
+            rm -f "$PIDFILE"
+        fi
+    else
+        if killall yolo_v4l2 2>/dev/null; then
+            echo "stopped $BINARY (no pidfile, killed by name)"
+        else
+            echo "no $BINARY found; none killed"
+        fi
+    fi
+    ;;
+  restart)
+    "$0" stop; sleep 1; "$0" start
+    ;;
+  status)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+        echo "ai-trap is running (PID=$(cat $PIDFILE))"
+    else
+        echo "ai-trap is not running"
+        exit 1
+    fi
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart|status}"
+    exit 1
+    ;;
+esac
+exit 0

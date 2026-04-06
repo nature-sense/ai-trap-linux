@@ -188,45 +188,28 @@ push_files() {
     cat > "${tmp_s99trap}" << 'INITEOF'
 #!/bin/sh
 # /etc/init.d/S99trap — ai-trap RKNN NPU build
+#
+# Design notes
+# ────────────
+# S21appinit (RkLunch.sh) starts rkipc at boot, which configures the ISP and
+# starts the full camera pipeline.  yolo_v4l2 opens /dev/video11 alongside
+# rkipc — the rkisp driver supports multiple readers on the main-path output.
+# Do NOT stop rkipc: tearing down the ISP pipeline leaves /dev/video11 with
+# no frames and causes V4L2Capture to block forever.
+#
+# rkaiq_3A_server is NOT started: running rkaiq causes rk_aiq_uapi_sysctl_start
+# to reconfigure the ISP hardware in a way that blocks NPU AXI DMA on RV1106
+# (NPU interrupt never fires, all inferences time out).  The rkipc-provided ISP
+# configuration is used instead — image has a slight green tint without AWB/CCM,
+# but detections work correctly.
 
 INSTALL_DIR=/opt/trap
 BINARY=$INSTALL_DIR/yolo_v4l2
 LOGFILE=/var/log/ai-trap.log
 PIDFILE=/var/run/ai-trap.pid
-RKAIQ_PIDFILE=/var/run/rkaiq_3A_server.pid
-IQFILES=/etc/iqfiles
 
 # RKNN runtime is in /opt/trap — add to dynamic linker search path
 export LD_LIBRARY_PATH=/opt/trap${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-
-start_isp() {
-    # Ensure IQ files are accessible at the path rkaiq_3A_server expects
-    [ -e "$IQFILES" ] || ln -sf /oem/usr/share/iqfiles "$IQFILES"
-
-    if [ -f "$RKAIQ_PIDFILE" ] && kill -0 "$(cat $RKAIQ_PIDFILE)" 2>/dev/null; then
-        echo "rkaiq_3A_server already running (PID=$(cat $RKAIQ_PIDFILE))"
-        return 0
-    fi
-
-    if command -v rkaiq_3A_server >/dev/null 2>&1; then
-        echo "Starting rkaiq_3A_server (ISP AWB/AE/AF)..."
-        rkaiq_3A_server >> "$LOGFILE" 2>&1 &
-        echo $! > "$RKAIQ_PIDFILE"
-        # Give the 3A server time to initialise the ISP before capture starts
-        sleep 2
-    else
-        echo "WARNING: rkaiq_3A_server not found — ISP will run without AWB/CCM"
-    fi
-}
-
-stop_isp() {
-    if [ -f "$RKAIQ_PIDFILE" ]; then
-        PID="$(cat "$RKAIQ_PIDFILE")"
-        kill "$PID" 2>/dev/null
-        rm -f "$RKAIQ_PIDFILE"
-    fi
-    killall rkaiq_3A_server 2>/dev/null || true
-}
 
 case "$1" in
   start)
@@ -234,7 +217,6 @@ case "$1" in
         echo "ai-trap is already running (PID=$(cat $PIDFILE))"
         exit 0
     fi
-    start_isp
     echo "Starting ai-trap (RKNN NPU)..."
     cd "$INSTALL_DIR"
     "$BINARY" \
@@ -268,7 +250,6 @@ case "$1" in
             echo "no $BINARY found; none killed"
         fi
     fi
-    stop_isp
     ;;
   restart)
     "$0" stop; sleep 1; "$0" start

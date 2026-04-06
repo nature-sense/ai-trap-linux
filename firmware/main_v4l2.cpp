@@ -9,19 +9,13 @@
 #include "sync_manager.h"
 #include "wifi_manager.h"
 #include "epaper_display.h"
-
-#ifdef USE_RKNN
 #include "rknn_infer.h"
-#else
-#include "ncnn/net.h"
-#endif
 
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -43,50 +37,25 @@ static void onSignal(int) { g_stop = true; }
 // ─────────────────────────────────────────────────────────────────────────────
 //  main
 //
-//  ncnn build:
-//    Usage: ./yolo_v4l2 [param] [bin] [db] [crops-dir] [device]
-//      param      ncnn .param file      (default yolo11n.param)
-//      bin        ncnn .bin file        (default yolo11n.bin)
-//      db         SQLite output path    (default detections.db)
-//      crops-dir  directory for crops   (default crops)
-//      device     V4L2 device node      (default /dev/video0)
-//
-//  RKNN build (-DUSE_RKNN):
-//    Usage: ./yolo_v4l2 [model.rknn] [db] [crops-dir] [device]
-//      model.rknn  RKNN model file       (default model.rknn)
-//      db          SQLite output path    (default detections.db)
-//      crops-dir   directory for crops   (default crops)
-//      device      V4L2 device node      (default /dev/video0)
+//  Usage: ./yolo_v4l2 [model.rknn] [db] [crops-dir] [device]
+//    model.rknn   RKNN NPU model file   (default model.rknn)
+//    db           SQLite output path    (default detections.db)
+//    crops-dir    directory for crops   (default crops)
+//    device       V4L2 device node      (default /dev/video0)
 // ─────────────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
-#ifdef USE_RKNN
     const char* rknnFile = argc > 1 ? argv[1] : "model.rknn";
     const char* dbPath   = argc > 2 ? argv[2] : "detections.db";
     const char* cropsDir = argc > 3 ? argv[3] : "crops";
     const char* device   = argc > 4 ? argv[4] : "/dev/video0";
-#else
-    const char* paramFile = argc > 1 ? argv[1] : "yolo11n.param";
-    const char* binFile   = argc > 2 ? argv[2] : "yolo11n.bin";
-    const char* dbPath    = argc > 3 ? argv[3] : "detections.db";
-    const char* cropsDir  = argc > 4 ? argv[4] : "crops";
-    const char* device    = argc > 5 ? argv[5] : "/dev/video0";
-#endif
 
     printf("══════════════════════════════════════════════════════════\n");
-#ifdef USE_RKNN
     printf("  YOLO11n  Luckfox Pico Zero  IMX415 V4L2 + RKNN NPU + ByteTracker\n");
     printf("══════════════════════════════════════════════════════════\n");
     printf("  model  : %s\n  db     : %s\n"
            "  crops  : %s\n  device : %s\n\n",
            rknnFile, dbPath, cropsDir, device);
-#else
-    printf("  YOLO11n  Luckfox Pico Zero  IMX415 V4L2 + ncnn + ByteTracker\n");
-    printf("══════════════════════════════════════════════════════════\n");
-    printf("  model  : %s / %s\n  db     : %s\n"
-           "  crops  : %s\n  device : %s\n\n",
-           paramFile, binFile, dbPath, cropsDir, device);
-#endif
 
     std::signal(SIGINT,  onSignal);
     std::signal(SIGTERM, onSignal);
@@ -164,6 +133,7 @@ int main(int argc, char* argv[]) {
 
     // ── HTTP API server ───────────────────────────────────────────────────────
     float currentFps = 0.f;
+    uint64_t g_frameCount = 0;   // incremented per inference, for fps calculation
     std::atomic<bool> g_capturing{true};
 
     HttpServer    http;
@@ -173,9 +143,6 @@ int main(int argc, char* argv[]) {
     httpCfg.trapId   = "luckfox_001";
 
     // ── WiFi manager ──────────────────────────────────────────────────────────
-    // Luckfox: creds live in /opt/trap/ (writable on Buildroot rootfs).
-    // On first boot (no creds) the trap starts in AP mode so the phone app
-    // can reach it and call POST /api/wifi to provision station credentials.
     WifiConfig wifiCfg;
     wifiCfg.credsPath = "/opt/trap/wifi_creds.conf";
     WifiManager wifi(httpCfg.trapId, wifiCfg);
@@ -183,9 +150,6 @@ int main(int argc, char* argv[]) {
     http.setWifiManager(&wifi);
 
     // ── e-Paper display ───────────────────────────────────────────────────────
-    // Defaults: disabled. Enable and set GPIO pins in EpaperDisplay::Config.
-    // Luckfox GPIO numbers differ from Pi BCM — set pinDc/pinRst/pinBusy to
-    // match your wiring (sysfs GPIO numbers for the RV1106).
     EpaperDisplay::Config dispCfg;
     // dispCfg.enabled    = true;
     // dispCfg.spiDev     = "/dev/spidev0.0";
@@ -203,80 +167,17 @@ int main(int argc, char* argv[]) {
         // non-fatal — continue without REST API
     }
 
-#ifdef USE_RKNN
     // ── RKNN model ────────────────────────────────────────────────────────────
     RknnInference net;
     if (!net.init(rknnFile, decCfg.modelWidth, decCfg.modelHeight)) {
         db.close();
         return 1;
     }
-    printf("RKNN model loaded: %s\n\n", rknnFile);
-#else
-    // ── ncnn model ────────────────────────────────────────────────────────────
-    ncnn::Net net;
-    net.opt.num_threads         = 4;
-    net.opt.use_vulkan_compute  = false;
-    net.opt.use_fp16_packed     = true;
-    net.opt.use_fp16_storage    = true;
-    net.opt.use_fp16_arithmetic = true;
-    net.opt.use_packing_layout  = true;
-    net.opt.lightmode           = true;
-
-    if (net.load_param(paramFile) != 0) {
-        fprintf(stderr, "Fatal: cannot load %s\n", paramFile);
-        db.close();
-        return 1;
-    }
-    if (net.load_model(binFile) != 0) {
-        fprintf(stderr, "Fatal: cannot load %s\n", binFile);
-        db.close();
-        return 1;
-    }
-    printf("Model loaded: %s\n\n", paramFile);
-
-    // Autodetect blob names from .param file
-    std::string inputName;
-    std::string outputName;
-    {
-        auto lastBlobToken = [](const std::string& s) -> std::string {
-            std::string last;
-            std::istringstream ss(s);
-            std::string tok;
-            while (ss >> tok)
-                if (tok.find('=') == std::string::npos)
-                    last = tok;
-            return last;
-        };
-
-        FILE* f = fopen(paramFile, "r");
-        if (f) {
-            char line[1024];
-            while (fgets(line, sizeof(line), f)) {
-                std::string s(line);
-                while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
-                                      s.back() == ' '  || s.back() == '\t'))
-                    s.pop_back();
-
-                if (strncmp(line, "Input",   5) == 0 && inputName.empty())
-                    inputName = lastBlobToken(s);
-                if (strncmp(line, "Concat",  6) == 0 ||
-                    strncmp(line, "Detect",  6) == 0 ||
-                    strncmp(line, "Permute", 7) == 0 ||
-                    strncmp(line, "Reshape", 7) == 0)
-                    outputName = lastBlobToken(s);
-            }
-            fclose(f);
-        }
-        if (inputName.empty())  inputName  = "images";
-        if (outputName.empty()) outputName = "output";
-        printf("Input layer:  \"%s\"\n", inputName.c_str());
-        printf("Output layer: \"%s\"\n\n", outputName.c_str());
-    }
-#endif
+    printf("RKNN model ready: %s  (NPU context deferred to inference thread)\n\n", rknnFile);
 
     // ── V4L2Capture — Luckfox IMX415-98 IR-CUT Camera ────────────────────────
     //
-    // IMX415 sensor modes on RV1103 (Luckfox Pico Zero):
+    // IMX415 sensor modes on RV1106 (Luckfox Pico Zero):
     //   3864 x 2192  @  7 fps  — full 4K (ISP bandwidth limited)
     //   1920 x 1080  @ 30 fps  — 1080p  ← recommended
     //   1280 x  720  @ 60 fps  — high framerate
@@ -284,9 +185,6 @@ int main(int argc, char* argv[]) {
     // Setup (once on board):
     //   v4l2-ctl -d /dev/video0 --list-formats-ext   # verify NV12 offered
     //   media-ctl --print-topology                   # confirm rkisp_mainpath
-    //
-    // IR-CUT: the cut filter is controlled externally (GPIO or rkaiq daemon).
-    // Day/night switching is handled outside this capture path.
 
     V4L2Config camCfg;
     camCfg.device        = device;
@@ -304,33 +202,24 @@ int main(int argc, char* argv[]) {
     });
 
     // ── Per-frame callback ────────────────────────────────────────────────────
-    // Identical to main_libcamera.cpp — CaptureFrame is the same struct.
 
     cam.setCallback([&](const CaptureFrame& frame) {
 
-        // Inference
+        // Inference — RKNN NPU
         ncnn::Mat output;
-#ifdef USE_RKNN
         if (!net.infer(static_cast<const float*>(frame.modelInput.data), output)) {
             fprintf(stderr, "[warn] rknn infer failed\n");
             return;
         }
-#else
-        {
-            ncnn::Extractor ex = net.create_extractor();
-            ex.input(inputName.c_str(), frame.modelInput);
-            if (ex.extract(outputName.c_str(), output) != 0) {
-                fprintf(stderr, "[warn] extract() failed\n");
-                return;
-            }
-        }
-#endif
 
         // Decode
         std::vector<Detection> dets = decoder.decode(
             output,
             frame.width, frame.height,
             frame.scale, frame.padLeft, frame.padTop);
+
+        // Update fps counter
+        g_frameCount++;
 
         // Track
         std::vector<TrackedObject> tracked = tracker.update(dets);
@@ -396,14 +285,21 @@ int main(int argc, char* argv[]) {
     printf("Running — Ctrl+C to stop\n\n");
 
     // ── Main loop ─────────────────────────────────────────────────────────────
-    auto lastStats = std::chrono::steady_clock::now();
-    auto startTime = lastStats;
+    auto lastStats    = std::chrono::steady_clock::now();
+    auto startTime    = lastStats;
+    uint64_t lastFrameCount = 0;
 
     while (!g_stop.load() && cam.isRunning()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         auto now = std::chrono::steady_clock::now();
         if (now - lastStats >= std::chrono::seconds(10)) {
+            // Update fps for HTTP API
+            double elapsed = std::chrono::duration<double>(now - lastStats).count();
+            uint64_t fc = g_frameCount;
+            currentFps = static_cast<float>((fc - lastFrameCount) / elapsed);
+            lastFrameCount = fc;
+
             cam.printStats();
             DetectionStats ds = db.getStats();
             printf("  DB rows=%lld  tracks=%lld  size=%.1f MB\n\n",
