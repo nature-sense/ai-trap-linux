@@ -145,12 +145,16 @@ if _cross_sysroot != ''
                       required : false)
   endif
 
-  # RKNN NPU mini-runtime — Luckfox v4l2 target only.
-  # librknnmrt.so and rknn_api.h are fetched from the Luckfox SDK by
-  # build-luckfox-mac.sh and installed to $SYSROOT/usr/lib and usr/include.
-  # RV1106 uses the mini-runtime (librknnmrt), not the full librknnrt.
   if is_arm_cross
+    # RKNN NPU mini-runtime (v4l2 and rkmpi targets).
+    # librknnmrt.so + rknn_api.h fetched from rknn-toolkit2 by build-luckfox-mac.sh.
+    # RV1106 uses the mini-runtime (librknnmrt), not the full librknnrt.
     rknn_dep = cxx.find_library('rknnmrt', dirs : [_lib], required : true)
+
+    # RKMPI / Rockit media framework (rkmpi target only).
+    # librockit.so + headers fetched from LuckfoxTECH/luckfox-pico SDK by
+    # build-luckfox-mac.sh.  Already present on the device at /usr/lib/librockit.so.
+    rockit_dep = cxx.find_library('rockit', dirs : [_lib], required : false)
   endif
 else
   sqlite3_dep = dependency('sqlite3', required : true)
@@ -164,7 +168,7 @@ cc = meson.get_compiler('cpp')
 
 # ── Option: select build target ───────────────────────────────────────────────
 
-target_opt = get_option('target')   # 'libcamera' | 'v4l2' | 'all'
+target_opt = get_option('target')   # 'libcamera' | 'v4l2' | 'rkmpi' | 'all'
 
 # ── Shared sources (compiled into both targets) ───────────────────────────────
 
@@ -216,7 +220,7 @@ endif
 
 # ── Luckfox Pico Zero / IMX415 / V4L2 target ─────────────────────────────────
 #
-# Inference runs on the RV1106 RKNN NPU via librknnmrt (zero-copy DMA API).
+# Stable baseline: V4L2 MMAP capture + software preprocessing + RKNN NPU.
 
 if target_opt == 'v4l2' or target_opt == 'all'
   executable('yolo_v4l2',
@@ -229,4 +233,37 @@ if target_opt == 'v4l2' or target_opt == 'all'
     dependencies        : shared_deps + [rknn_dep],
     cpp_args            : ['-DWIFI_BACKEND_HOSTAPD'],
   )
+endif
+
+# ── Luckfox Pico Zero / IMX415 / RKMPI+VPSS target ───────────────────────────
+#
+# Prototype: RKMPI VI + VPSS hardware scaling + async RKNN NPU inference.
+#
+# Key improvements over v4l2:
+#   - VPSS (RGA2) scales 1920×1080 → 320×320 in hardware (~9 ms CPU saved/frame)
+#   - VPSS delivers a second channel at 640×480 for streaming (no extra CPU)
+#   - Async inference thread: capture preprocessing and rknn_run overlap
+#   - rkipc must be stopped before launch (see S99trap-rkmpi in package/)
+#
+# Requires: librockit.so + RKMPI headers in sysroot (build-luckfox-mac.sh)
+
+if target_opt == 'rkmpi' or target_opt == 'all'
+  if not is_arm_cross or not rockit_dep.found()
+    if target_opt == 'rkmpi'
+      error('target=rkmpi requires librockit.so in the Luckfox sysroot. ' +
+            'Run build-luckfox-mac.sh to fetch it.')
+    endif
+    # In target=all, skip rkmpi silently if rockit is not yet available.
+  else
+    executable('yolo_rkmpi',
+      sources : shared_sources + files(
+        'firmware/src/io/rkmpi_capture.cpp',
+        'firmware/src/io/rknn_infer.cpp',
+        'firmware/main_rkmpi.cpp',
+      ),
+      include_directories : inc,
+      dependencies        : shared_deps + [rknn_dep, rockit_dep],
+      cpp_args            : ['-DWIFI_BACKEND_HOSTAPD'],
+    )
+  endif
 endif

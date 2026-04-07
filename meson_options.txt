@@ -1,8 +1,8 @@
 option('target',
   type    : 'combo',
-  choices : ['libcamera', 'v4l2', 'all'],
+  choices : ['libcamera', 'v4l2', 'rkmpi', 'all'],
   value   : 'libcamera',
-  description : 'Which capture backend to build: libcamera (Pi 5), v4l2 (Luckfox Pico Zero), or all'
+  description : 'Which capture backend to build: libcamera (Pi 5), v4l2 (Luckfox V4L2+RKNN), rkmpi (Luckfox RKMPI+VPSS+RKNN), or all'
 )
 
 option('luckfox_sysroot',

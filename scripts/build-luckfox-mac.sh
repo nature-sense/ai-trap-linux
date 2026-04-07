@@ -190,6 +190,57 @@ else
     banner "RKNN mini-runtime cached — skipping fetch  (${LIB_VER})"
 fi
 
+# ── RKMPI / Rockit headers + library ─────────────────────────────────────────
+#
+# librockit.so (lib32) and RKMPI headers are fetched from the Luckfox SDK:
+#   media/rockit/rockit/mpi/sdk/include/   → SYSROOT/usr/include/rkmpi/
+#   media/rockit/rockit/lib/lib32/librockit.so → SYSROOT/usr/lib/
+#
+# librockit.so is already present on the device at /usr/lib/librockit.so —
+# we only need it in the sysroot for linking.
+#
+# The sparse checkout is done into /tmp/luckfox-sdk-rockit and removed after.
+
+ROCKIT_MARKER="${SYSROOT}/usr/include/rkmpi/rk_mpi_vi.h"
+
+if [[ ! -f "${ROCKIT_MARKER}" ]]; then
+    banner "Fetching RKMPI headers + librockit.so from Luckfox SDK"
+    mkdir -p "${SYSROOT}/usr/include/rkmpi" "${SYSROOT}/usr/lib"
+
+    git clone --depth 1 --filter=blob:none --sparse \
+        https://github.com/LuckfoxTECH/luckfox-pico.git /tmp/luckfox-sdk-rockit
+    cd /tmp/luckfox-sdk-rockit
+    git sparse-checkout set \
+        "media/rockit/rockit/mpi/sdk/include" \
+        "media/rockit/rockit/lib/lib32"
+
+    ROCKIT_INC="media/rockit/rockit/mpi/sdk/include"
+    ROCKIT_LIB="media/rockit/rockit/lib/lib32"
+
+    if [[ -d "${ROCKIT_INC}" ]]; then
+        cp -v "${ROCKIT_INC}/"*.h "${SYSROOT}/usr/include/rkmpi/"
+        echo "RKMPI headers → ${SYSROOT}/usr/include/rkmpi/"
+    else
+        echo "ERROR: RKMPI headers not found in Luckfox SDK" >&2
+        ls media/rockit/ >&2 || true
+        exit 1
+    fi
+
+    if [[ -f "${ROCKIT_LIB}/librockit.so" ]]; then
+        cp -v "${ROCKIT_LIB}/librockit.so" "${SYSROOT}/usr/lib/"
+        echo "librockit.so → ${SYSROOT}/usr/lib/"
+    else
+        echo "ERROR: librockit.so not found in Luckfox SDK" >&2
+        ls "${ROCKIT_LIB}/" >&2 || true
+        exit 1
+    fi
+
+    cd /
+    rm -rf /tmp/luckfox-sdk-rockit
+else
+    banner "RKMPI headers + librockit.so cached — skipping fetch"
+fi
+
 # ── Meson cross file ─────────────────────────────────────────────────────────
 
 banner "Generating meson cross file"
@@ -216,8 +267,8 @@ pkg_config_libdir = '${SYSROOT}/usr/lib/pkgconfig:${SYSROOT}/usr/share/pkgconfig
 cmake_prefix_path = ['${SYSROOT}/usr']
 
 [built-in options]
-cpp_args = ['-isystem', '${SYSROOT}/usr/include']
-c_args   = ['-isystem', '${SYSROOT}/usr/include']
+cpp_args = ['-isystem', '${SYSROOT}/usr/include', '-isystem', '${SYSROOT}/usr/include/rkmpi']
+c_args   = ['-isystem', '${SYSROOT}/usr/include', '-isystem', '${SYSROOT}/usr/include/rkmpi']
 EOF
 
 # ── Configure + build ─────────────────────────────────────────────────────────
@@ -226,7 +277,7 @@ banner "Configuring (meson)"
 rm -rf "${BUILD_DIR}"
 meson setup "${BUILD_DIR}" /src \
     --cross-file "${CROSS_FILE}" \
-    -Dtarget=v4l2 \
+    -Dtarget=all \
     -Dluckfox_sysroot="${SYSROOT}" \
     --buildtype=release
 
@@ -235,11 +286,14 @@ ninja -C "${BUILD_DIR}"
 
 # ── Strip ─────────────────────────────────────────────────────────────────────
 
-banner "Stripping binary"
+banner "Stripping binaries"
 "${BIN}-strip" "${BUILD_DIR}/yolo_v4l2"
+[[ -f "${BUILD_DIR}/yolo_rkmpi" ]] && "${BIN}-strip" "${BUILD_DIR}/yolo_rkmpi"
 
 banner "Done"
-echo "Binary : build-luckfox/yolo_v4l2"
+echo "Binaries:"
+echo "  build-luckfox/yolo_v4l2   (stable V4L2 baseline)"
+echo "  build-luckfox/yolo_rkmpi  (RKMPI+VPSS prototype, if librockit.so found)"
 echo
 echo "Deploy :"
 echo "  bash scripts/luckfox-install.sh"
