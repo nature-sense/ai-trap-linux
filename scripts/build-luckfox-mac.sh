@@ -6,8 +6,6 @@
 #  on an Apple Silicon (or Intel) Mac using Docker.
 #
 #  Inference runs on the RV1106 NPU via the Rockchip RKNN runtime.
-#  ncnn is retained as a library (ncnn::Mat is the shared tensor type) but
-#  is not used for inference.
 #
 #  Requirements:
 #    Docker Desktop — https://www.docker.com/products/docker-desktop/
@@ -18,9 +16,9 @@
 #  Output:
 #    build-luckfox/yolo_v4l2
 #
-#  All deps (toolchain, SQLite3, NCNN, librknnmrt) are cached in:
+#  All deps (toolchain, SQLite3, librknnmrt) are cached in:
 #    ~/.cache/ai-trap/luckfox/
-#  Subsequent builds skip the download/compile phase (~25 min first time).
+#  Subsequent builds skip the download/compile phase.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -66,9 +64,8 @@ TOOLCHAIN_DIR="${CACHE_DIR}/toolchain"
 SYSROOT="${CACHE_DIR}/sysroot"
 BUILD_DIR="/src/build-luckfox"
 
-SQLITE_VERSION="3450100"
-SQLITE_YEAR="2024"
-NCNN_VERSION="20240410"
+SQLITE_VERSION="3510300"
+SQLITE_YEAR="2026"
 ARM_FLAGS="-march=armv7-a -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -O2"
 JOBS="$(nproc)"
 
@@ -86,6 +83,7 @@ apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     cmake ninja-build meson pkg-config make \
     curl ca-certificates git \
+    gcc \
     libbluetooth-dev
 
 # ── Toolchain ─────────────────────────────────────────────────────────────────
@@ -154,93 +152,42 @@ else
     banner "SQLite3 cached — skipping build"
 fi
 
-# ── NCNN ──────────────────────────────────────────────────────────────────────
-#
-# ncnn::Mat is the shared tensor transport type used throughout the capture and
-# decoder pipeline.  Inference itself runs on the RKNN NPU, not ncnn::Net.
-
-if [[ ! -f "${SYSROOT}/usr/lib/libncnn.a" ]]; then
-    banner "Cross-compiling NCNN ${NCNN_VERSION}"
-    git clone --depth 1 --branch "${NCNN_VERSION}" \
-        https://github.com/Tencent/ncnn.git /tmp/ncnn-src
-    cmake -S /tmp/ncnn-src -B /tmp/ncnn-build \
-        -DCMAKE_SYSTEM_NAME=Linux \
-        -DCMAKE_SYSTEM_PROCESSOR=arm \
-        -DCMAKE_C_COMPILER="${GCC}" \
-        -DCMAKE_CXX_COMPILER="${GXX}" \
-        -DCMAKE_C_FLAGS="${ARM_FLAGS}" \
-        -DCMAKE_CXX_FLAGS="${ARM_FLAGS}" \
-        -DCMAKE_INSTALL_PREFIX="${SYSROOT}/usr" \
-        -DNCNN_TARGET_ARCH=arm \
-        -DNCNN_SHARED_LIB=OFF \
-        -DNCNN_BUILD_TESTS=OFF \
-        -DNCNN_BUILD_EXAMPLES=OFF \
-        -DNCNN_BUILD_TOOLS=OFF \
-        -DNCNN_BUILD_BENCHMARK=OFF \
-        -DNCNN_VULKAN=OFF \
-        -DCMAKE_BUILD_TYPE=Release
-    cmake --build /tmp/ncnn-build -j"${JOBS}"
-    cmake --install /tmp/ncnn-build
-    rm -rf /tmp/ncnn-src /tmp/ncnn-build
-else
-    banner "NCNN cached — skipping build"
-fi
-
 # ── RKNN runtime (librknnmrt.so + rknn_api.h) ────────────────────────────────
 #
 # RV1106 uses the RKNN *mini* runtime (librknnmrt.so), not the full librknnrt.so
 # (which is for higher-end chips like RK3588).
 #
-# Both files ship in the Luckfox SDK and are cached in the sysroot after the
-# first fetch.
+# VERSION PINNING — this must match the toolkit2 version used in
+# Dockerfile.rknn-toolkit2.  Mismatched versions cause rknn_inputs_set to
+# fail at runtime.  Both files are fetched from the matching GitHub release:
+#   https://github.com/airockchip/rknn-toolkit2/releases/tag/v2.3.2
 #
-# SDK paths tried in order:
-#   lib:    media/iva/iva/librockiva/rockiva-rv1106-Linux/lib/librknnmrt.so
-#           project/cfg/BoardConfig_IPC/overlay/overlay-luckfox-glibc-rockchip/usr/lib/librknnmrt.so
-#   header: project/app/rk_smart_door/smart_door/common/face/algo/rknn_api.h
-#           project/app/rk_smart_door/smart_door/common/face/algo_dual_ir/include/rknn_api.h
+# armhf-uclibc: correct variant for Luckfox Pico Zero (Cortex-A7, uClibc).
+# Driver compatibility: librknnmrt.so v2.x requires rknpu driver > 0.8.0.
+# The Luckfox BSP ships driver 0.9.2 which satisfies this — no BSP update needed.
+
+RKNN_VERSION="v2.3.2"
+RKNN_BASE="https://raw.githubusercontent.com/airockchip/rknn-toolkit2/${RKNN_VERSION}/rknpu2/runtime/Linux/librknn_api"
 
 if [[ ! -f "${SYSROOT}/usr/lib/librknnmrt.so" ]]; then
-    banner "Fetching RKNN mini-runtime from Luckfox SDK"
-    git clone --depth 1 --filter=blob:none --sparse \
-        https://github.com/LuckfoxTECH/luckfox-pico.git /tmp/luckfox-sdk-npu
-    cd /tmp/luckfox-sdk-npu
-    git sparse-checkout set \
-        "media/iva/iva/librockiva/rockiva-rv1106-Linux" \
-        "project/cfg/BoardConfig_IPC/overlay/overlay-luckfox-glibc-rockchip/usr/lib" \
-        "project/app/rk_smart_door/smart_door/common/face/algo"
-
-    RKNN_LIB=""
-    for p in \
-        "media/iva/iva/librockiva/rockiva-rv1106-Linux/lib/librknnmrt.so" \
-        "project/cfg/BoardConfig_IPC/overlay/overlay-luckfox-glibc-rockchip/usr/lib/librknnmrt.so"; do
-        [[ -f "${p}" ]] && RKNN_LIB="${p}" && break
-    done
-
-    RKNN_HDR=""
-    for p in \
-        "project/app/rk_smart_door/smart_door/common/face/algo/rknn_api.h" \
-        "project/app/rk_smart_door/smart_door/common/face/algo_dual_ir/include/rknn_api.h"; do
-        [[ -f "${p}" ]] && RKNN_HDR="${p}" && break
-    done
-
-    if [[ -z "${RKNN_LIB}" || -z "${RKNN_HDR}" ]]; then
-        echo "ERROR: could not find librknnmrt.so or rknn_api.h in Luckfox SDK." >&2
-        echo "       SDK tree (rknn-related files):" >&2
-        git ls-tree -r --name-only HEAD | grep -i rknn | head -30 >&2 || true
-        exit 1
-    fi
-
+    banner "Fetching RKNN mini-runtime ${RKNN_VERSION} from GitHub"
     mkdir -p "${SYSROOT}/usr/lib" "${SYSROOT}/usr/include"
-    cp "${RKNN_LIB}" "${SYSROOT}/usr/lib/librknnmrt.so"
-    cp "${RKNN_HDR}" "${SYSROOT}/usr/include/rknn_api.h"
 
-    cd /
-    rm -rf /tmp/luckfox-sdk-npu
-    echo "librknnmrt.so → ${SYSROOT}/usr/lib/"
+    curl -fL "${RKNN_BASE}/armhf-uclibc/librknnmrt.so" \
+         -o "${SYSROOT}/usr/lib/librknnmrt.so" || {
+        echo "ERROR: failed to download librknnmrt.so" >&2; exit 1
+    }
+    curl -fL "${RKNN_BASE}/include/rknn_api.h" \
+         -o "${SYSROOT}/usr/include/rknn_api.h" || {
+        echo "ERROR: failed to download rknn_api.h" >&2; exit 1
+    }
+
+    LIB_VER="$(strings "${SYSROOT}/usr/lib/librknnmrt.so" | grep 'librknnmrt version:' || true)"
+    echo "librknnmrt.so → ${SYSROOT}/usr/lib/  (${LIB_VER})"
     echo "rknn_api.h    → ${SYSROOT}/usr/include/"
 else
-    banner "RKNN mini-runtime cached — skipping fetch"
+    LIB_VER="$(strings "${SYSROOT}/usr/lib/librknnmrt.so" | grep 'librknnmrt version:' || true)"
+    banner "RKNN mini-runtime cached — skipping fetch  (${LIB_VER})"
 fi
 
 # ── Meson cross file ─────────────────────────────────────────────────────────

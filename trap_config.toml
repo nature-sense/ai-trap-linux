@@ -111,6 +111,11 @@ port         = 9000
 width        = 640
 height       = 480
 jpeg_quality = 75               # lower = less CPU on the Pi
+# Software white-balance gains (stream only — not applied to model input).
+# Compensates for ISP running without rkaiq AWB/CCM.  Tune to taste.
+wb_r = 2.00
+wb_g = 1.00
+wb_b = 1.20
 
 # ─────────────────────────────────────────────────────────────────────────────
 

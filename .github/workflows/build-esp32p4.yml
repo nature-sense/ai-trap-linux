@@ -1,0 +1,305 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  build-esp32p4.yml
+#
+#  Builds the ai-trap ESP32-P4 firmware (firmware-esp32p4/) using the official
+#  Espressif IDF Docker image.  The container ships ESP-IDF v5.3 with the
+#  RISC-V toolchain pre-installed — no cross-compilation setup required.
+#
+#  Stages
+#  ──────
+#  1. Components  — fetch managed components (esp-dl ≥2.0, esp-detection,
+#                   esp_cam_sensor) via idf.py update-dependencies.
+#                   Result cached by idf_component.yml hash so component
+#                   downloads are only repeated when versions change.
+#
+#  2. Build       — idf.py set-target esp32p4 (generates sdkconfig from
+#                   sdkconfig.defaults) then idf.py build (CMake + Ninja,
+#                   invoked internally by idf.py).
+#
+#  3. Artifact    — flash bundle uploaded for 30 days:
+#                     bootloader.bin, partition-table.bin, ai-trap-esp32p4.bin
+#                     espdet_pico.espdl  (if bundled by esp-detection component)
+#                     nvs_config_template.csv  (WiFi + trap config template)
+#                     flash.sh  (one-shot esptool.py helper)
+#
+#  Trigger
+#  ───────
+#  Push/PR to main touching firmware-esp32p4/** or this workflow file.
+#  workflow_dispatch for manual runs (e.g. to produce a release candidate).
+#
+#  Notes
+#  ─────
+#  • ESP32-P4 support requires ESP-IDF ≥ 5.3.  The release-v5.3 Docker tag
+#    tracks the latest 5.3.x patch, giving security fixes without API churn.
+#  • The ESPDet-Pico .espdl model is a pre-quantised binary from espressif/
+#    esp-dl, NOT produced by this build.  If the esp-detection component
+#    bundles it, it is included in the artifact; otherwise MODEL_README.txt
+#    documents how to download and flash it separately to the model partition.
+#  • sdkconfig is generated at build time from sdkconfig.defaults and is NOT
+#    committed (add firmware-esp32p4/sdkconfig to .gitignore).
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Build · ESP32-P4 (FreeRTOS / ESP-IDF)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firmware-esp32p4/**'
+      - '.github/workflows/build-esp32p4.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'firmware-esp32p4/**'
+      - '.github/workflows/build-esp32p4.yml'
+  workflow_dispatch:
+
+env:
+  IDF_TARGET:  esp32p4
+  PROJECT_DIR: firmware-esp32p4
+
+jobs:
+  build-esp32p4:
+    name: ESP32-P4 firmware (FreeRTOS)
+    runs-on: ubuntu-latest
+
+    # Official Espressif IDF Docker image.
+    # Contains: ESP-IDF v5.3, riscv32-esp-elf toolchain, CMake, Ninja,
+    # Python venv with all IDF host tools.  $IDF_PATH is pre-set in the image.
+    container:
+      image: espressif/idf:release-v5.3
+
+    defaults:
+      run:
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+
+    steps:
+
+      # ── Checkout ─────────────────────────────────────────────────────────────
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: false   # firmware-esp32p4/ has no git submodules;
+                              # managed components are fetched via idf.py
+
+      # ── Managed component cache ───────────────────────────────────────────────
+      #
+      # esp-dl, esp-detection, and esp_cam_sensor are downloaded by the IDF
+      # component manager into managed_components/ on the first build.
+      # Caching this directory means component downloads are only repeated when
+      # idf_component.yml changes (e.g. a version bump).
+      #
+      # Cache key includes the IDF version string so a toolchain upgrade always
+      # gets fresh components (component ABIs can change between IDF releases).
+
+      - name: Cache managed components
+        id: cache-components
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PROJECT_DIR }}/managed_components
+          key: esp32p4-components-idf5.3-${{ hashFiles('firmware-esp32p4/idf_component.yml') }}
+          restore-keys: |
+            esp32p4-components-idf5.3-
+
+      # ── Set target ────────────────────────────────────────────────────────────
+      #
+      # Generates sdkconfig from sdkconfig.defaults for the esp32p4 target.
+      # Must run before idf.py build even on cache hits because sdkconfig is
+      # not committed and is not in the component cache.
+
+      - name: Set target (esp32p4)
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target ${{ env.IDF_TARGET }}
+          echo "=== sdkconfig target line ==="
+          grep '^CONFIG_IDF_TARGET=' sdkconfig
+
+      # ── Fetch managed components ──────────────────────────────────────────────
+      #
+      # Downloads components declared in idf_component.yml.  Skipped when the
+      # cache is valid — managed_components/ is already fully populated.
+
+      - name: Fetch managed components
+        if: steps.cache-components.outputs.cache-hit != 'true'
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py update-dependencies
+          echo "=== Components fetched ==="
+          ls -1 managed_components/ 2>/dev/null
+
+      - name: Report cached components
+        if: steps.cache-components.outputs.cache-hit == 'true'
+        run: |
+          echo "=== Managed components (from cache) ==="
+          ls -1 managed_components/ 2>/dev/null
+
+      # ── Build ─────────────────────────────────────────────────────────────────
+      #
+      # idf.py build drives CMake + Ninja internally.
+      # Compile flags are set by sdkconfig.defaults (PSRAM, PM, LP core, etc.).
+      # The ULP LP-core program (ulp/ulp_pir_monitor.c) is compiled and linked
+      # automatically by the ULP CMake helper in main/CMakeLists.txt.
+
+      - name: Build firmware
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py build
+
+          echo ""
+          echo "=== Build outputs ==="
+          ls -lh \
+            build/bootloader/bootloader.bin \
+            build/partition_table/partition-table.bin \
+            build/ai-trap-esp32p4.bin
+
+          echo ""
+          echo "=== Binary size breakdown ==="
+          python3 $IDF_PATH/tools/idf_size.py \
+            --format table build/ai-trap-esp32p4.map 2>/dev/null \
+            || echo "(idf_size.py not available in this IDF version — skipped)"
+
+      # ── Package flash bundle ──────────────────────────────────────────────────
+      #
+      # Assembles a self-contained tarball that can be taken to any machine
+      # with esptool.py installed and flashed with a single command:
+      #
+      #   tar xzf ai-trap-esp32p4-<sha7>.tar.gz
+      #   cd ai-trap-esp32p4-<sha7>/
+      #   ./flash.sh /dev/ttyUSB0
+      #
+      # Flash offsets match partitions.csv:
+      #   0x0000000  bootloader.bin
+      #   0x0009000  partition-table.bin
+      #   0x0010000  ai-trap-esp32p4.bin  (app)
+      #   0x0290000  espdet_pico.espdl    (model — if present)
+      #   0x0009000  nvs.bin              (generated from nvs_config_template.csv)
+
+      - name: Package flash bundle
+        run: |
+          SHORT="${{ github.sha }}"
+          SHORT="${SHORT:0:7}"
+          PKG="ai-trap-esp32p4-${SHORT}"
+          mkdir -p "${PKG}"
+
+          # ── Core binaries ────────────────────────────────────────────────────
+          cp build/bootloader/bootloader.bin           "${PKG}/"
+          cp build/partition_table/partition-table.bin "${PKG}/"
+          cp build/ai-trap-esp32p4.bin                 "${PKG}/"
+
+          # ── ESPDet-Pico model ────────────────────────────────────────────────
+          # The esp-detection managed component may bundle a pre-quantised
+          # ESPDet-Pico .espdl binary.  Include it if found; otherwise write
+          # a README explaining how to obtain and flash it separately.
+          MODEL=$(find managed_components -name "*.espdl" 2>/dev/null | head -1)
+          if [ -n "$MODEL" ]; then
+            cp "$MODEL" "${PKG}/espdet_pico.espdl"
+            echo "ESPDet-Pico model included: $(basename "$MODEL")"
+          else
+            cat > "${PKG}/MODEL_README.txt" << 'MODEL_EOF'
+          ESPDet-Pico model (.espdl) is NOT included in this package.
+
+          It is a pre-quantised INT8 binary from the espressif/esp-dl project,
+          not produced by this build.
+
+          Download:
+            https://github.com/espressif/esp-dl/releases
+            (look for espdet_pico_224_int8.espdl or similar)
+
+          Flash to the model partition (4 MB at offset 0x290000):
+            esptool.py --chip esp32p4 --port /dev/ttyUSB0 --baud 921600 \
+              write_flash 0x290000 espdet_pico_224_int8.espdl
+
+          The firmware runs without the model but InferenceTask will stall
+          at startup with an error log and no detections will be produced.
+          MODEL_EOF
+            echo "ESPDet-Pico model not bundled — MODEL_README.txt written"
+          fi
+
+          # ── NVS provisioning template ────────────────────────────────────────
+          # Edit wifi_ssid / wifi_pass / server_url, then:
+          #   python $IDF_PATH/components/nvs_flash/nvs_partition_generator/
+          #          nvs_partition_gen.py generate nvs_config_template.csv nvs.bin 0x6000
+          #   esptool.py --chip esp32p4 --port PORT write_flash 0x9000 nvs.bin
+          cat > "${PKG}/nvs_config_template.csv" << 'NVS_EOF'
+          key,type,encoding,value
+          trap_cfg,namespace,,
+          trap_id,data,u16,1
+          wifi_ssid,data,string,CHANGE_ME
+          wifi_pass,data,string,CHANGE_ME
+          server_url,data,string,http://192.168.1.100:8080/api/detections
+          idle_timeout,data,u32,30
+          pir_gpio,data,u8,5
+          conf_thresh,data,u32,1045220198
+          NVS_EOF
+          # conf_thresh is float 0.45 stored as uint32 IEEE-754 bitcast:
+          # python3 -c "import struct; print(struct.unpack('I', struct.pack('f', 0.45))[0])"
+
+          # ── Flash helper script ───────────────────────────────────────────────
+          cat > "${PKG}/flash.sh" << 'FLASH_EOF'
+          #!/usr/bin/env bash
+          # flash.sh — Flash ai-trap ESP32-P4 firmware
+          # Usage: ./flash.sh [PORT] [BAUD]
+          #   PORT  Serial port, default /dev/ttyUSB0
+          #   BAUD  Baud rate,   default 921600
+          set -euo pipefail
+
+          PORT="${1:-/dev/ttyUSB0}"
+          BAUD="${2:-921600}"
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+
+          echo "==> Flashing ai-trap ESP32-P4 to ${PORT} @ ${BAUD}"
+
+          esptool.py \
+            --chip esp32p4 \
+            --port  "${PORT}" \
+            --baud  "${BAUD}" \
+            --before default_reset \
+            --after  hard_reset \
+            write_flash \
+              0x0000000 "${DIR}/bootloader.bin" \
+              0x0009000 "${DIR}/partition-table.bin" \
+              0x0010000 "${DIR}/ai-trap-esp32p4.bin"
+
+          if [ -f "${DIR}/espdet_pico.espdl" ]; then
+            echo "==> Flashing ESPDet-Pico model (model partition @ 0x290000) ..."
+            esptool.py \
+              --chip esp32p4 \
+              --port "${PORT}" --baud "${BAUD}" \
+              write_flash 0x0290000 "${DIR}/espdet_pico.espdl"
+          else
+            echo ""
+            echo "WARNING: ESPDet-Pico model not in package — see MODEL_README.txt"
+          fi
+
+          echo ""
+          echo "==> Firmware flashed.  Next: provision WiFi credentials."
+          echo ""
+          echo "    1. Edit nvs_config_template.csv (wifi_ssid, wifi_pass, server_url)"
+          echo "    2. Generate NVS image:"
+          echo "         python \$IDF_PATH/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py \\"
+          echo "           generate nvs_config_template.csv nvs.bin 0x6000"
+          echo "    3. Flash NVS partition:"
+          echo "         esptool.py --chip esp32p4 --port ${PORT} write_flash 0x9000 nvs.bin"
+          FLASH_EOF
+          chmod +x "${PKG}/flash.sh"
+
+          # ── Archive ──────────────────────────────────────────────────────────
+          tar -czf "${PKG}.tar.gz" "${PKG}/"
+          echo "PKG_FILE=${PKG}.tar.gz" >> "$GITHUB_ENV"
+
+          echo ""
+          echo "=== Package contents ==="
+          tar -tzf "${PKG}.tar.gz"
+          echo ""
+          du -sh "${PKG}.tar.gz"
+
+      # ── Upload ────────────────────────────────────────────────────────────────
+
+      - name: Upload flash bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-trap-esp32p4-${{ github.sha }}
+          path: ${{ env.PROJECT_DIR }}/${{ env.PKG_FILE }}
+          retention-days: 30

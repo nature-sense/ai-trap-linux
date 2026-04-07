@@ -212,6 +212,9 @@ static bool loadConfig(const char* path, TrapConfig& cfg) {
                 else if (key == "width")        cfg.stream.streamWidth   = detail::toInt(val);
                 else if (key == "height")       cfg.stream.streamHeight  = detail::toInt(val);
                 else if (key == "jpeg_quality") cfg.stream.jpegQuality   = detail::toInt(val);
+                else if (key == "wb_r")         cfg.stream.wbR           = detail::toFloat(val);
+                else if (key == "wb_g")         cfg.stream.wbG           = detail::toFloat(val);
+                else if (key == "wb_b")         cfg.stream.wbB           = detail::toFloat(val);
 
             } else if (section == "sse") {
                 if      (key == "port")            cfg.sse.port           = detail::toInt(val);
@@ -222,10 +225,11 @@ static bool loadConfig(const char* path, TrapConfig& cfg) {
                 if (key == "port") cfg.http.port = detail::toInt(val);
 
             } else if (section == "wifi") {
-                if      (key == "managed")     cfg.wifi.managed    = detail::toBool(val);
-                else if (key == "ap_password") cfg.wifi.apPassword = val;
-                else if (key == "iface")       cfg.wifi.iface      = val;
-                else if (key == "creds_path")  cfg.wifi.credsPath  = val;
+                if      (key == "managed")              cfg.wifi.managed            = detail::toBool(val);
+                else if (key == "ap_password")          cfg.wifi.apPassword         = val;
+                else if (key == "iface")                cfg.wifi.iface              = val;
+                else if (key == "creds_path")           cfg.wifi.credsPath          = val;
+                else if (key == "inactivity_seconds")   cfg.wifi.inactivitySeconds  = detail::toInt(val);
 
             } else if (section == "database") {
                 if (key == "path") cfg.dbPath = val;

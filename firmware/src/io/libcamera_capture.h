@@ -9,7 +9,7 @@
 #include <libcamera/request.h>
 #include <libcamera/stream.h>
 
-#include "ncnn/mat.h"
+#include "float_mat.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -123,9 +123,8 @@ struct CaptureFrame {
     int   padLeft = 0;
     int   padTop  = 0;
 
-    // Preprocessed model input ready for ncnn inference.
-    // Layout: channel-planar RGB, normalised [0, 1], shape [3, modelH, modelW]
-    ncnn::Mat modelInput;
+    // Preprocessed model input: channel-planar RGB [0,1], shape [3, modelH, modelW]
+    FloatMat modelInput;
 
     // Raw NV12 frame (compact, de-strided): Y plane followed by interleaved UV.
     // Size: width * height * 3 / 2 bytes.
@@ -142,8 +141,7 @@ struct CaptureFrame {
 //
 //  Pixel format
 //  ────────────
-//  Requests NV12 from the ISP — the only format accepted directly by
-//  ncnn::yuv420sp2rgb_nv12() without an extra CPU conversion step.
+//  Requests NV12 from the ISP.
 //  The ISP performs demosaic, AWB, AEC, and tone mapping before output.
 //
 //  Thread model
@@ -262,9 +260,9 @@ private:
     // libcamera completion signal — runs on the libcamera event thread
     void requestComplete(libcamera::Request* request);
 
-    // NV12 → letterboxed normalised RGB ncnn::Mat
-    ncnn::Mat preprocess(const uint8_t* nv12, int width, int height,
-                         float& scale, int& padLeft, int& padTop) const;
+    // NV12 → letterboxed normalised RGB FloatMat (CHW, [0,1])
+    FloatMat preprocess(const uint8_t* nv12, int width, int height,
+                        float& scale, int& padLeft, int& padTop) const;
 
     // Build the initial ControlList from m_cfg
     void applyControls(libcamera::ControlList& controls) const;

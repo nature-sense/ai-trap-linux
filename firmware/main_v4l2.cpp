@@ -206,8 +206,8 @@ int main(int argc, char* argv[]) {
     cam.setCallback([&](const CaptureFrame& frame) {
 
         // Inference — RKNN NPU
-        ncnn::Mat output;
-        if (!net.infer(static_cast<const float*>(frame.modelInput.data), output)) {
+        FloatMat output;
+        if (!net.infer(frame.modelInput.data(), output)) {
             fprintf(stderr, "[warn] rknn infer failed\n");
             return;
         }

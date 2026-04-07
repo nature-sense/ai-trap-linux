@@ -1,0 +1,12 @@
+# ai-trap ESP32-P4 flash partition table
+# Total flash: 16 MB (typical for Stamp-P4 or custom board)
+#
+# Name,     Type,  SubType,  Offset,    Size,   Flags
+nvs,        data,  nvs,      0x9000,    0x6000,
+phy_init,   data,  phy,      0xF000,    0x1000,
+# 2.5 MB app partition
+factory,    app,   factory,  0x10000,   0x280000,
+# 4 MB ESPDet-Pico model data
+model,      data,  0xFF,     0x290000,  0x400000,
+# 1.5 MB SPIFFS (logs, samples)
+storage,    data,  spiffs,   0x690000,  0x170000,

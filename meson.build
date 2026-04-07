@@ -18,7 +18,7 @@
 #    sudo dpkg --add-architecture arm64
 #    sudo apt-get install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
 #                         libcamera-dev:arm64
-#    # Build NCNN + SQLite3 into /opt/pi5-sysroot (see cross/pi5-aarch64.ini)
+#    # Build SQLite3 into /opt/pi5-sysroot (see cross/pi5-aarch64.ini)
 #    meson setup build-pi5 \
 #      --cross-file cross/pi5-aarch64.ini \
 #      -Dtarget=libcamera \
@@ -27,7 +27,7 @@
 #
 #  Cross-compile for Luckfox Pico Zero (RV1106G3) on Ubuntu x86:
 #    # Install arm-rockchip830-linux-uclibcgnueabihf toolchain first
-#    # Build NCNN + SQLite3 into /opt/luckfox-sysroot (see cross/luckfox-rv1106.ini)
+#    # Build SQLite3 + librknnmrt into /opt/luckfox-sysroot (see scripts/build-luckfox-mac.sh)
 #    meson setup build-luckfox \
 #      --cross-file cross/luckfox-rv1106.ini \
 #      -Dtarget=v4l2 \
@@ -68,11 +68,11 @@ endif
 # ── CPU-specific compile flags ─────────────────────────────────────────────────
 #
 #  armv7  (Luckfox RV1106G3 / Cortex-A7):
-#    -mfpu=neon-vfpv4  enables NEON intrinsics used by NCNN
+#    -mfpu=neon-vfpv4  enables NEON intrinsics
 #    -mfloat-abi=hard  matches the uClibc hard-float ABI
 #
 #  aarch64 (Raspberry Pi 5 / Cortex-A76):
-#    +dotprod+fp16     enables NCNN ASIMD dot-product and FP16 kernels
+#    +dotprod+fp16     enables ASIMD dot-product and FP16
 
 if is_arm_cross
   _cpu_flags = [
@@ -113,10 +113,9 @@ endif
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 #
-# For cross-builds, NCNN and SQLite3 are located directly via find_library()
-# from the staging sysroot — more reliable than pkg-config or cmake discovery
-# in a cross environment.  libcamera is always discovered via pkg-config since
-# it is installed to the system multiarch path by apt.
+# For cross-builds, SQLite3 is located directly via find_library() from the
+# staging sysroot.  libcamera is always discovered via pkg-config since it is
+# installed to the system multiarch path by apt.
 
 cxx = meson.get_compiler('cpp')
 
@@ -135,7 +134,6 @@ if _cross_sysroot != ''
   _lib      = _cross_sysroot + '/usr/lib'
   _lib_arch = _cross_sysroot + '/usr/lib/aarch64-linux-gnu'
 
-  ncnn_dep    = cxx.find_library('ncnn',    dirs : [_lib], required : true)
   sqlite3_dep = cxx.find_library('sqlite3', dirs : [_lib], required : true)
 
   # libcamera: if pkg-config already found it (e.g. via the sysroot
@@ -156,28 +154,6 @@ if _cross_sysroot != ''
   endif
 else
   sqlite3_dep = dependency('sqlite3', required : true)
-
-  ncnn_dep = dependency('ncnn', required : false)
-  if not ncnn_dep.found()
-    cmake = import('cmake')
-    ncnn_opts = cmake.subproject_options()
-    ncnn_opts.add_cmake_defines({
-      'NCNN_BUILD_EXAMPLES'  : 'OFF',
-      'NCNN_BUILD_TOOLS'     : 'OFF',
-      'NCNN_BUILD_BENCHMARK' : 'OFF',
-      'NCNN_VULKAN'          : 'OFF',
-    })
-    ncnn_proj = cmake.subproject('ncnn', options : ncnn_opts)
-    # NCNN's build tree exposes headers under src/ directly, but the
-    # codebase uses #include "ncnn/mat.h".  The generated meson.build
-    # adds '.' (the subproject root) to the include path, so a
-    # ncnn/ -> src/ symlink there makes both styles work.
-    run_command('ln', '-sfn',
-      meson.project_source_root() / 'subprojects/ncnn/src',
-      meson.project_source_root() / 'subprojects/ncnn/ncnn',
-      check : true)
-    ncnn_dep  = ncnn_proj.dependency('ncnn')
-  endif
 endif
 
 # Bluetooth headers — needed for BLE GATT server (Pi 5 and Luckfox).
@@ -208,7 +184,7 @@ shared_sources = files(
   'firmware/src/common/epaper_display.cpp',
 )
 
-shared_deps = [ncnn_dep, sqlite3_dep, thread_dep, omp_dep]
+shared_deps = [sqlite3_dep, thread_dep, omp_dep]
 
 inc = include_directories([
                             'firmware/src/common',
@@ -240,9 +216,7 @@ endif
 
 # ── Luckfox Pico Zero / IMX415 / V4L2 target ─────────────────────────────────
 #
-# RKNN NPU inference is the only supported backend for the Luckfox target.
-# ncnn is retained as a library dependency because ncnn::Mat is used as the
-# shared tensor transport type throughout the capture and decoder pipeline.
+# Inference runs on the RV1106 RKNN NPU via librknnmrt (zero-copy DMA API).
 
 if target_opt == 'v4l2' or target_opt == 'all'
   executable('yolo_v4l2',

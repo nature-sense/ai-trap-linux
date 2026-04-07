@@ -3,5 +3,9 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/api" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/firmware/models" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/subprojects/ncnn" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/subprojects/ncnn/glslang" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/subprojects/ncnn/python/pybind11" vcs="Git" />
   </component>
 </project>

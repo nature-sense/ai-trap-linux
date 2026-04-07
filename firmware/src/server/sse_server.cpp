@@ -31,7 +31,7 @@ static bool writeAll(int fd, const char* buf, size_t len) {
 void SseServer::open(const SseConfig& cfg) {
     m_cfg = cfg;
 
-    m_listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
+    m_listenFd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (m_listenFd < 0)
         throw std::runtime_error(std::string("SseServer: socket: ") + strerror(errno));
 
@@ -92,8 +92,9 @@ void SseServer::acceptLoop() {
     while (m_running.load()) {
         sockaddr_in peer{};
         socklen_t   peerLen = sizeof(peer);
-        int fd = ::accept(m_listenFd,
-                          reinterpret_cast<sockaddr*>(&peer), &peerLen);
+        int fd = ::accept4(m_listenFd,
+                           reinterpret_cast<sockaddr*>(&peer), &peerLen,
+                           SOCK_CLOEXEC);
         if (fd < 0) {
             if (m_running.load())
                 fprintf(stderr, "SseServer: accept: %s\n", strerror(errno));

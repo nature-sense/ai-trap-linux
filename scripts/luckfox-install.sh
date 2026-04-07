@@ -9,9 +9,10 @@
 #
 #  Usage
 #  ─────
-#    bash scripts/luckfox-install.sh           # auto: local build or GitHub Release
-#    bash scripts/luckfox-install.sh --local   # force use of local build
-#    bash scripts/luckfox-install.sh --release # force download latest GitHub Release
+#    bash scripts/luckfox-install.sh              # auto: local build or GitHub Release
+#    bash scripts/luckfox-install.sh --local      # force use of local build
+#    bash scripts/luckfox-install.sh --release    # force download latest GitHub Release
+#    bash scripts/luckfox-install.sh --rknpu-only # push rknpu.ko only (no app reinstall)
 #
 #  Package source (in order of preference, unless overridden)
 #  ─────────────────────────────────────────────────────────
@@ -27,6 +28,7 @@
 #    /opt/trap/crops/             crop output directory
 #    /etc/init.d/S50wifi          WiFi AP/station manager
 #    /etc/init.d/S99trap          ai-trap service
+#    /oem/usr/ko/rknpu.ko         Rockchip NPU kernel module (if --rknpu-only or --with-rknpu)
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -202,6 +204,11 @@ push_files() {
 # (NPU interrupt never fires, all inferences time out).  The rkipc-provided ISP
 # configuration is used instead — image has a slight green tint without AWB/CCM,
 # but detections work correctly.
+#
+# bypass_irq_handler=1: switches the NPU from interrupt-driven to polling mode.
+# On RV1106, the ISP DMA interrupt can starve the NPU completion interrupt (IRQ 37)
+# at a specific model layer (Conv:/model.8, task 85), causing a 6-second rknn_run
+# timeout.  Polling bypasses the interrupt path entirely, eliminating the stall.
 
 INSTALL_DIR=/opt/trap
 BINARY=$INSTALL_DIR/yolo_v4l2
@@ -218,6 +225,15 @@ case "$1" in
         exit 0
     fi
     echo "Starting ai-trap (RKNN NPU)..."
+    # Reload the NPU driver to recover from any prior SIGKILL that arrived
+    # during rknn_run — SIGKILL during inference corrupts rknpu driver state
+    # and causes rknn_init to fail on the next launch.  rmmod/insmod is fast
+    # (~100 ms) and safe to run unconditionally on every start.
+    rmmod rknpu 2>/dev/null || true
+    insmod /oem/usr/ko/rknpu.ko
+    # Switch NPU to polling mode — prevents ISP DMA from starving the NPU
+    # completion interrupt (IRQ 37) at Conv:/model.8 (task 85 of 113).
+    echo 1 > /sys/module/rknpu/parameters/bypass_irq_handler
     cd "$INSTALL_DIR"
     "$BINARY" \
         "$INSTALL_DIR/model.rknn" \
@@ -230,26 +246,23 @@ case "$1" in
     ;;
   stop)
     echo "Stopping ai-trap..."
-    if [ -f "$PIDFILE" ]; then
-        PID="$(cat "$PIDFILE")"
-        if kill "$PID" 2>/dev/null; then
-            echo "stopped $BINARY (pid $PID)"
-            rm -f "$PIDFILE"
-        else
-            if killall yolo_v4l2 2>/dev/null; then
-                echo "stopped $BINARY (by name)"
-            else
-                echo "no $BINARY found; none killed"
-            fi
-            rm -f "$PIDFILE"
-        fi
-    else
-        if killall yolo_v4l2 2>/dev/null; then
-            echo "stopped $BINARY (no pidfile, killed by name)"
-        else
-            echo "no $BINARY found; none killed"
-        fi
-    fi
+    # Kill ALL yolo_v4l2 instances (pidfile may be stale if a previous stop
+    # failed to wait for the process to exit).
+    killall yolo_v4l2 2>/dev/null || true
+    rm -f "$PIDFILE"
+    # Wait up to 10 s for SIGTERM to be honoured (process may be inside a
+    # 6-second rknn_run timeout and can't handle signals until it returns).
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 1
+        pgrep -x yolo_v4l2 > /dev/null 2>&1 || { echo "ai-trap stopped."; exit 0; }
+        echo "  waiting for process to exit... (${i}s)"
+    done
+    # Still alive after 10 s — force-kill.  Driver state will be recovered by
+    # rmmod/insmod at the start of the next S99trap start invocation.
+    echo "  process did not exit gracefully — sending SIGKILL"
+    killall -9 yolo_v4l2 2>/dev/null || true
+    sleep 1
+    echo "ai-trap killed."
     ;;
   restart)
     "$0" stop; sleep 1; "$0" start
@@ -281,6 +294,47 @@ INITEOF
     adb shell "ls -lh ${INSTALL_DIR}/"
 }
 
+# ── rknpu.ko deployment ───────────────────────────────────────────────────────
+
+push_rknpu_ko() {
+    local ko_path="$1"
+
+    step "Pushing rknpu.ko to device"
+
+    # Verify vermagic before pushing — a mismatched module will silently fail
+    # to load and leave the NPU inaccessible.
+    local vermagic
+    vermagic="$(strings "${ko_path}" | grep '^vermagic=' || true)"
+    info "  built vermagic : ${vermagic}"
+
+    local device_vermagic
+    device_vermagic="$(adb shell "strings /oem/usr/ko/rknpu.ko 2>/dev/null | grep '^vermagic='" 2>/dev/null | tr -d '\r' || true)"
+    info "  device vermagic: ${device_vermagic}"
+
+    if [[ -n "${device_vermagic}" && "${vermagic}" != "${device_vermagic}" ]]; then
+        error "vermagic mismatch — built module won't load on this kernel.
+       built : ${vermagic}
+       device: ${device_vermagic}
+       Rebuild with: bash scripts/build-rknpu-ko.sh"
+    fi
+
+    adb push "${ko_path}" /oem/usr/ko/rknpu.ko
+    info "  rknpu.ko pushed ✓"
+
+    step "Reloading rknpu kernel module"
+    # ai-trap must be stopped before unloading rknpu (it has an open NPU context).
+    adb shell "/etc/init.d/S99trap stop 2>/dev/null; sleep 2" 2>/dev/null || true
+    adb shell "rmmod rknpu 2>/dev/null || true; sleep 1; insmod /oem/usr/ko/rknpu.ko"
+    local drv_ver
+    drv_ver="$(adb shell "cat /sys/module/rknpu/version 2>/dev/null" | tr -d '\r' || true)"
+    info "  rknpu driver version: ${drv_ver}"
+    info "  rknpu.ko reloaded ✓"
+
+    step "Restarting ai-trap"
+    adb shell "/etc/init.d/S99trap start"
+    info "  ai-trap restarted ✓"
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 MODE="${1:-auto}"
@@ -290,6 +344,22 @@ ensure_adb
 
 step "Waiting for ADB device"
 wait_for_adb
+
+# ── rknpu-only mode ───────────────────────────────────────────────────────────
+
+if [[ "${MODE}" == "--rknpu-only" ]]; then
+    RKNPU_KO="${REPO_ROOT}/build-luckfox/rknpu.ko"
+    [[ -f "${RKNPU_KO}" ]] || \
+        error "rknpu.ko not found. Build first: bash scripts/build-rknpu-ko.sh"
+    push_rknpu_ko "${RKNPU_KO}"
+    echo
+    echo "─────────────────────────────────────────────────────"
+    info "rknpu kernel module updated."
+    echo "─────────────────────────────────────────────────────"
+    exit 0
+fi
+
+# ── Full application install ──────────────────────────────────────────────────
 
 TMPDIR_PKG="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR_PKG}"' EXIT
@@ -305,7 +375,6 @@ if [[ "${MODE}" == "--local" ]] || \
     if [[ ! -f "${REPO_ROOT}/firmware/models/yolo11n-320/model.rknn" ]]; then
         error "model.rknn not found. Convert first:
        bash firmware/models/scripts/convert-rknn.sh \\
-           firmware/models/yolo11n-320/model.onnx \\
            firmware/models/yolo11n-320/model.rknn \\
            firmware/models/calibration"
     fi
@@ -339,7 +408,14 @@ elif [[ "${MODE}" == "--release" ]] || [[ "${MODE}" == "auto" ]]; then
 
 else
     error "Unknown option: ${MODE}
-       Usage: $0 [--local | --release]"
+       Usage: $0 [--local | --release | --rknpu-only]"
+fi
+
+# Optionally also push a locally-built rknpu.ko if present alongside the binary.
+if [[ -f "${REPO_ROOT}/build-luckfox/rknpu.ko" ]]; then
+    echo
+    warn "build-luckfox/rknpu.ko found — pushing updated kernel module"
+    push_rknpu_ko "${REPO_ROOT}/build-luckfox/rknpu.ko"
 fi
 
 echo

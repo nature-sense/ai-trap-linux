@@ -1,5 +1,5 @@
 #include "v4l2_capture.h"
-#include "ncnn/mat.h"
+#include "imgproc.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -423,12 +423,10 @@ void V4L2Capture::dispatchLoop() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  preprocess  — NV12 → letterboxed normalised RGB ncnn::Mat
-//
-//  Identical to LibcameraCapture::preprocess.
+//  preprocess  — NV12 → letterboxed normalised RGB FloatMat (CHW, [0,1])
 // ─────────────────────────────────────────────────────────────────────────────
 
-ncnn::Mat V4L2Capture::preprocess(
+FloatMat V4L2Capture::preprocess(
     const uint8_t* nv12,
     int width, int height,
     float& scale, int& padLeft, int& padTop) const
@@ -436,10 +434,9 @@ ncnn::Mat V4L2Capture::preprocess(
     const int dstW = m_cfg.modelWidth;
     const int dstH = m_cfg.modelHeight;
 
-    // NV12 → packed RGB (NEON-optimised, handles BT.601 limited-range)
-    ncnn::Mat rgb(width, height, 3);
-    ncnn::yuv420sp2rgb_nv12(nv12, width, height,
-                            static_cast<uint8_t*>(rgb.data));
+    // NV12 → packed RGB uint8 (HWC), BT.601 limited-range
+    std::vector<uint8_t> rgbBuf(static_cast<size_t>(width * height * 3));
+    nv12_to_rgb_u8(nv12, width, height, rgbBuf.data());
 
     // Letterbox: scale to fit dstW×dstH preserving aspect ratio
     scale   = std::min(static_cast<float>(dstW) / width,
@@ -449,29 +446,28 @@ ncnn::Mat V4L2Capture::preprocess(
     padLeft  = (dstW - newW) / 2;
     padTop   = (dstH - newH) / 2;
 
-    ncnn::Mat resized;
-    ncnn::resize_bilinear(rgb, resized, newW, newH);
+    // Bilinear resize packed RGB uint8 to (newW × newH)
+    std::vector<uint8_t> resized(static_cast<size_t>(newW * newH * 3));
+    bilinear_resize_rgb_u8(rgbBuf.data(), width, height,
+                           resized.data(), newW, newH);
 
-    // Pad with grey (114)
-    ncnn::Mat padded(dstW, dstH, 3);
-    padded.fill(114.f);
+    // Allocate 3-channel CHW float mat, fill with letterbox grey (114/255)
+    FloatMat out(dstW, dstH, 3);
+    out.fill(114.f / 255.f);
 
-    for (int c = 0; c < 3; c++) {
-        float*       dst = padded.channel(c);
-        const float* src = resized.channel(c);
-        for (int y = 0; y < newH; y++) {
-            std::memcpy(dst + (padTop + y) * dstW + padLeft,
-                        src + y * newW,
-                        static_cast<size_t>(newW) * sizeof(float));
+    // Copy resized pixels into each channel plane, normalising uint8 → [0,1]
+    for (int c = 0; c < 3; ++c) {
+        float*         dst = out.channel(c);
+        const uint8_t* src = resized.data();
+        for (int y = 0; y < newH; ++y) {
+            float*         dstRow = dst + (padTop + y) * dstW + padLeft;
+            const uint8_t* srcRow = src + y * newW * 3;
+            for (int x = 0; x < newW; ++x)
+                dstRow[x] = srcRow[x * 3 + c] * (1.f / 255.f);
         }
     }
 
-    // Normalise [0,255] → [0,1]
-    const float mean[3] = { 0.f,     0.f,     0.f     };
-    const float norm[3] = { 1/255.f, 1/255.f, 1/255.f };
-    padded.substract_mean_normalize(mean, norm);
-
-    return padded;
+    return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

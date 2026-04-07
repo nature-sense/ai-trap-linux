@@ -1,0 +1,74 @@
+# ── Target ────────────────────────────────────────────────────────────────────
+CONFIG_IDF_TARGET="esp32p4"
+
+# ── Flash ─────────────────────────────────────────────────────────────────────
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ── PSRAM (32 MB on-package octal SPI) ───────────────────────────────────────
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+
+# ── Power management — enable auto light-sleep ────────────────────────────────
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=3
+
+# ── FreeRTOS ──────────────────────────────────────────────────────────────────
+CONFIG_FREERTOS_HZ=1000
+# Stack overflow detection in debug builds
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+
+# ── Memory ────────────────────────────────────────────────────────────────────
+# Static allocation reduces heap fragmentation
+CONFIG_HEAP_TRACING_STANDALONE=n
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
+
+# ── WiFi ──────────────────────────────────────────────────────────────────────
+# ESP32-P4 uses hosted WiFi via a companion chip — must enable ESP_HOST_WIFI_ENABLED
+CONFIG_ESP_HOST_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER=y
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=0
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_NVS_ENABLED=y
+
+# ── Compiler ──────────────────────────────────────────────────────────────────
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
+
+# ── ULP / LP Core ─────────────────────────────────────────────────────────────
+CONFIG_ULP_COPROC_ENABLED=y
+CONFIG_ULP_COPROC_TYPE_LP_CORE=y
+CONFIG_ULP_COPROC_RESERVE_MEM=4096
+
+# ── HTTP client ───────────────────────────────────────────────────────────────
+CONFIG_ESP_HTTP_CLIENT_ENABLE_BASIC_AUTH=n
+CONFIG_ESP_HTTP_CLIENT_ENABLE_DIGEST_AUTH=n
+
+# ── NVS ───────────────────────────────────────────────────────────────────────
+CONFIG_NVS_ENCRYPTION=n
+
+# ── VFS for model loading ─────────────────────────────────────────────────────
+CONFIG_VFS_SUPPORT_TERMIOS=n
+
+# ── esp-dl pixel conversion (only enable what the pipeline actually uses) ──────
+# Disable RGB565 and RGB888→RGB565 conversions — these use P4 PIE vector
+# instructions (esp.vsld.8 trunc) that require a newer toolchain than
+# esp-14.2.0_20251107.  Camera → inference pipeline uses YUV420 → RGB888 only.
+CONFIG_PIX_CVT_RGB565_TO_GRAY_SUPPORT=n
+CONFIG_PIX_CVT_RGB565_TO_HSV_SUPPORT=n
+CONFIG_PIX_CVT_RGB565_TO_RGB565_SUPPORT=n
+CONFIG_PIX_CVT_RGB565_TO_RGB888_SUPPORT=n
+CONFIG_PIX_CVT_RGB888_TO_RGB565_SUPPORT=n

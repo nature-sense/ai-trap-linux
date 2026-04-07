@@ -1,7 +1,6 @@
 #include "crop_saver.h"
 
-// ncnn — for NV12→RGB conversion
-#include "ncnn/mat.h"
+#include "imgproc.h"
 
 // stb_image_write — implementation compiled in stb_image_write_impl.cpp
 #pragma GCC diagnostic push
@@ -225,7 +224,7 @@ void CropSaver::workerLoop() {
 //
 //  Steps:
 //   1. Extract the NV12 crop region into a compact sub-buffer.
-//   2. Convert NV12 crop → packed RGB via ncnn::yuv420sp2rgb_nv12.
+//   2. Convert NV12 crop → packed RGB via nv12_to_rgb_u8.
 //   3. Encode RGB → JPEG via stb_image_write.
 //   4. Write file (overwrites previous best for this track).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -264,9 +263,8 @@ bool CropSaver::writeCrop(const CropJob& job) {
                     static_cast<size_t>(CW));
 
     // ── 2. NV12 → packed RGB ─────────────────────────────────────────────────
-    // ncnn::yuv420sp2rgb_nv12 expects compact NV12 and writes packed RGB.
     std::vector<uint8_t> rgb(static_cast<size_t>(CW * CH * 3));
-    ncnn::yuv420sp2rgb_nv12(cropNV12.data(), CW, CH, rgb.data());
+    nv12_to_rgb_u8(cropNV12.data(), CW, CH, rgb.data());
 
     // ── 3. Encode and write JPEG ──────────────────────────────────────────────
     // stbi_write_jpg: (path, w, h, channels, data, quality)

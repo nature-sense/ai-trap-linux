@@ -52,6 +52,11 @@ port         = 9000
 width        = 640
 height       = 480
 jpeg_quality = 75
+# Software white-balance gains (stream only — not applied to model input).
+# Compensates for ISP running without rkaiq AWB/CCM.  Tune to taste.
+wb_r = 2.00
+wb_g = 1.00
+wb_b = 1.20
 
 [sse]
 port            = 8081
@@ -67,10 +72,11 @@ path = "/opt/trap/detections.db"
 [wifi]
 # managed = true  → S50wifi handles AP/station switching via REST API
 # managed = false → WiFi managed by OS (development only)
-managed     = true
-ap_password = "aiwildlife"
-iface       = "wlan0"
-creds_path  = "/opt/trap/wifi_creds.conf"
+managed              = true
+ap_password          = "aiwildlife"
+iface                = "wlan0"
+creds_path           = "/opt/trap/wifi_creds.conf"
+inactivity_seconds   = 0    # 0 = keep AP up indefinitely (field deployment)
 
 [display]
 enabled = false

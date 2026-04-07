@@ -3,9 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  RknnInference — thin wrapper around the Rockchip RKNN NPU runtime.
 //
-//  Only compiled when -DUSE_RKNN is set (Luckfox RKNN build).
-//  The ncnn dependency is still present for ncnn::Mat, which is used
-//  throughout the capture and decoder pipeline.
+//  Only compiled when building the Luckfox RKNN target.
 //
 //  *** RV1106 / librknnmrt ZERO-COPY API ***
 //
@@ -31,12 +29,12 @@
 //    RknnInference net;
 //    if (!net.init("model.rknn", 320, 320)) return 1;
 //    ...
-//    ncnn::Mat out;
-//    if (!net.infer((float*)frame.modelInput.data, out)) return;
+//    FloatMat out;
+//    if (!net.infer(frame.modelInput.data(), out)) return;
 //    auto dets = decoder.decode(out, ...);
 // ─────────────────────────────────────────────────────────────────────────────
 
-#include "ncnn/mat.h"
+#include "float_mat.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -58,11 +56,11 @@ public:
     bool init(const std::string& modelPath, int inputW, int inputH);
 
     // Run one inference pass.  inputCHW must point to inputH × inputW × 3
-    // channel-planar float32 values (NCHW layout, matching ncnn::Mat).
-    // On success, sets `out` to an ncnn::Mat wrapping the output buffer —
+    // channel-planar float32 values in CHW layout.
+    // On success, sets `out` to a FloatMat wrapping the dequantised output —
     // valid until the next call to infer() or deinit().
     // Returns false on failure.
-    bool infer(const float* inputCHW, ncnn::Mat& out);
+    bool infer(const float* inputCHW, FloatMat& out);
 
     void deinit();
 
@@ -75,6 +73,10 @@ private:
     std::vector<uint8_t>  m_modelBytes;          // raw model bytes loaded at init()
     bool                  m_readyToInit = false; // set by init(), cleared by lazyInitCtx()
 
+    // Self-healing watchdog counters
+    int                   m_consecutiveFailures = 0; // reset on each successful infer
+    int                   m_totalRecoveries     = 0; // cumulative reinit count
+
     uint64_t              m_ctx         = 0;     // rknn_context (uint32_t on RV1106)
 
     // Zero-copy DMA buffers, allocated once in lazyInitCtx().
@@ -85,8 +87,8 @@ private:
     int                   m_inputH      = 0;
     int                   m_inStride    = 0;     // w_stride from INPUT_ATTR (may > inputW)
 
-    int                   m_outW        = 0;     // ncnn Mat w (number of anchors / columns)
-    int                   m_outH        = 0;     // ncnn Mat h (4 + numClasses / rows)
+    int                   m_outW        = 0;     // FloatMat w (number of anchors / columns)
+    int                   m_outH        = 0;     // FloatMat h (4 + numClasses / rows)
     uint32_t              m_outElems    = 0;     // total output elements
     float                 m_outScale    = 1.f;   // affine dequant scale
     int32_t               m_outZp       = 0;     // affine dequant zero-point

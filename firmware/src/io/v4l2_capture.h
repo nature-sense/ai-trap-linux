@@ -67,7 +67,7 @@
 //    cam.stop();
 // ─────────────────────────────────────────────────────────────────────────────
 
-#include "ncnn/mat.h"
+#include "float_mat.h"
 
 // Re-use CaptureFrame from libcamera_capture.h if both backends are present,
 // otherwise define it here.  Guard prevents double-definition.
@@ -90,7 +90,7 @@ struct CaptureFrame {
     int   padTop  = 0;
 
     // Preprocessed model input: channel-planar RGB [0,1], shape [3,modelH,modelW]
-    ncnn::Mat modelInput;
+    FloatMat modelInput;
 
     // Raw compact NV12: Y plane then interleaved UV, width*height*3/2 bytes.
     std::vector<uint8_t> nv12;
@@ -209,9 +209,9 @@ private:
     void captureLoop();
     void dispatchLoop();
 
-    // ── Preprocessing (identical to LibcameraCapture::preprocess) ─────────────
-    ncnn::Mat preprocess(const uint8_t* nv12, int width, int height,
-                         float& scale, int& padLeft, int& padTop) const;
+    // ── Preprocessing ──────────────────────────────────────────────────────────
+    FloatMat preprocess(const uint8_t* nv12, int width, int height,
+                        float& scale, int& padLeft, int& padTop) const;
 
     // ── Counters ──────────────────────────────────────────────────────────────
     uint64_t              m_frameId = 0;

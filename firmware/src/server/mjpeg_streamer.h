@@ -13,10 +13,16 @@
 //  MjpegStreamerConfig
 // ─────────────────────────────────────────────────────────────────────────────
 struct MjpegStreamerConfig {
-    int port         = 9000;   // HTTP listen port
-    int jpegQuality  = 75;     // JPEG quality 1–100 (lower = less CPU)
-    int streamWidth  = 640;    // output frame width  (NV12 is scaled to this)
-    int streamHeight = 480;    // output frame height
+    int   port         = 9000;   // HTTP listen port
+    int   jpegQuality  = 75;     // JPEG quality 1–100 (lower = less CPU)
+    int   streamWidth  = 640;    // output frame width  (NV12 is scaled to this)
+    int   streamHeight = 480;    // output frame height
+    // Software white-balance gains applied after NV12→RGB (stream only, not model input).
+    // Compensates for ISP running without rkaiq AWB/CCM on RV1106.
+    // Tune via [stream] wb_r / wb_g / wb_b in trap_config.toml.
+    float wbR = 1.80f;
+    float wbG = 1.00f;
+    float wbB = 1.55f;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

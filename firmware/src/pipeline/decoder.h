@@ -4,7 +4,7 @@
 #include <vector>
 #include <cstdint>
 
-namespace ncnn { class Mat; }
+#include "float_mat.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Detection  — one bounding box from one inference pass
@@ -22,7 +22,7 @@ struct Detection {
 //                Reliable for multi-class models.  For single-class models
 //                both formats produce h=5, so score sampling is used:
 //                scores > 1.0 → Format A (raw logits); ≤ 1.0 → Format B.
-//  AnchorGrid  — force Format A (YOLO11 default ncnn export)
+//  AnchorGrid  — force Format A (YOLO11 default YOLO11 export)
 //  EndToEnd    — force Format B (NMS baked into model)
 //  DFL         — RKNN stripped-DFL format (RV1106 NPU)
 //                h = 4*reg_max + nc (e.g. 65 for single-class, reg_max=16)
@@ -39,7 +39,7 @@ struct DecoderConfig {
     float      confThresh    = 0.45f;            // minimum score to keep
     float      nmsThresh     = 0.45f;            // IoU threshold for NMS (Format A only)
     int        numClasses    = 80;               // set to match your model
-    int        modelWidth    = 640;              // must match the ncnn export imgsz
+    int        modelWidth    = 640;              // must match the YOLO11 export imgsz
     int        modelHeight   = 640;
     YoloFormat format        = YoloFormat::Auto; // override auto-detection if needed
 
@@ -60,9 +60,9 @@ struct DecoderConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 //  YoloDecoder
 //
-//  Decodes raw ncnn output tensors from YOLO11n into detections.
+//  Decodes raw YOLO output tensors from YOLO11n into detections.
 //
-//  FORMAT A  anchor-grid  (YOLO11n default ncnn export)
+//  FORMAT A  anchor-grid  (YOLO11n default YOLO11 export)
 //    dims=2,  h = 4 + numClasses,  w = numAnchors (~2100 for 320 input)
 //    Column i:  rows 0-3 = cx,cy,bw,bh (model pixels)
 //               rows 4+  = raw logit class scores (sigmoid applied in decoder)
@@ -80,13 +80,13 @@ class YoloDecoder {
 public:
     explicit YoloDecoder(const DecoderConfig& cfg = {});
 
-    // Decode a raw ncnn output tensor.
+    // Decode a raw YOLO output tensor.
     // srcW/srcH   — original camera frame dimensions in pixels
     // scale       — letterbox scale factor from preprocessing
     // padLeft/Top — letterbox padding in model pixels
     // Returns detections in original image pixel coordinates.
     std::vector<Detection> decode(
-        const ncnn::Mat& out,
+        const FloatMat& out,
         int   srcW,    int srcH,
         float scale,
         int   padLeft, int padTop) const;
@@ -95,27 +95,27 @@ public:
     void setConfig(const DecoderConfig& cfg) { m_cfg = cfg; }
 
     // Print tensor shape and sample rows — useful when verifying a new export.
-    void debugTensor(const ncnn::Mat& out, int maxRows = 5) const;
+    void debugTensor(const FloatMat& out, int maxRows = 5) const;
 
 private:
     DecoderConfig m_cfg;
 
     std::vector<Detection> dispatch(
-        const ncnn::Mat& out,
+        const FloatMat& out,
         int srcW, int srcH, float scale, int padLeft, int padTop) const;
 
     std::vector<Detection> decodeAnchorGrid(
-        const ncnn::Mat& out,
+        const FloatMat& out,
         int srcW, int srcH, float scale, int padLeft, int padTop) const;
 
     std::vector<Detection> decodeEndToEnd(
-        const ncnn::Mat& out,
+        const FloatMat& out,
         int srcW, int srcH, float scale, int padLeft, int padTop) const;
 
     // RKNN stripped-DFL format (RV1106): raw DFL logits + pre-sigmoid class scores.
     // h = 4*reg_max + numClasses,  w = numAnchors.
     std::vector<Detection> decodeDFL(
-        const ncnn::Mat& out,
+        const FloatMat& out,
         int srcW, int srcH, float scale, int padLeft, int padTop) const;
 
     std::vector<Detection> nms(std::vector<Detection> dets) const;

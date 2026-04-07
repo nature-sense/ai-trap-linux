@@ -12,7 +12,6 @@
 #include "wifi_manager.h"
 #include "ble_gatt_server.h"
 #include "epaper_display.h"
-#include "ncnn/net.h"
 
 #include <atomic>
 #include <chrono>
@@ -66,7 +65,7 @@ int main(int argc, char* argv[]) {
     const char* configPath = argc > 1 ? argv[1] : "trap_config.toml";
 
     printf("═══════════════════════════════════════════════\n");
-    printf("  YOLO11n  Pi 5  libcamera + ncnn + ByteTracker\n");
+    printf("  YOLO11n  Pi 5  libcamera + ByteTracker\n");
     printf("═══════════════════════════════════════════════\n");
     printf("  config : %s\n\n", configPath);
 
@@ -303,68 +302,6 @@ int main(int argc, char* argv[]) {
     // crops are immediately written into a timestamped subdirectory.
     startCaptureSession();
 
-    // ── ncnn model ────────────────────────────────────────────────────────────
-
-    ncnn::Net net;
-    net.opt.num_threads         = 4;
-    net.opt.use_vulkan_compute  = false;
-    net.opt.use_fp16_packed     = false;
-    net.opt.use_fp16_storage    = false;
-    net.opt.use_fp16_arithmetic = false;
-    net.opt.use_packing_layout  = true;
-    net.opt.lightmode           = true;
-
-    if (net.load_param(cfg.modelParam.c_str()) != 0) {
-        fprintf(stderr, "Fatal: cannot load %s\n", cfg.modelParam.c_str());
-        http.close(); sse.close(); streamer.close(); crops.close(); db.close();
-        return 1;
-    }
-    if (net.load_model(cfg.modelBin.c_str()) != 0) {
-        fprintf(stderr, "Fatal: cannot load %s\n", cfg.modelBin.c_str());
-        http.close(); sse.close(); streamer.close(); crops.close(); db.close();
-        return 1;
-    }
-    printf("Model loaded: %s\n\n", cfg.modelParam.c_str());
-
-    // ── Autodetect blob names from .param file ────────────────────────────────
-
-    std::string inputName;
-    std::string outputName;
-    {
-        auto lastBlobToken = [](const std::string& s) -> std::string {
-            std::string last;
-            std::istringstream ss(s);
-            std::string tok;
-            while (ss >> tok)
-                if (tok.find('=') == std::string::npos)
-                    last = tok;
-            return last;
-        };
-
-        FILE* f = fopen(cfg.modelParam.c_str(), "r");
-        if (f) {
-            char line[1024];
-            while (fgets(line, sizeof(line), f)) {
-                std::string s(line);
-                while (!s.empty() && (s.back()=='\n'||s.back()=='\r'||
-                                      s.back()==' ' ||s.back()=='\t'))
-                    s.pop_back();
-                if (strncmp(line, "Input",   5) == 0 && inputName.empty())
-                    inputName = lastBlobToken(s);
-                if (strncmp(line, "Concat",  6) == 0 ||
-                    strncmp(line, "Detect",  6) == 0 ||
-                    strncmp(line, "Permute", 7) == 0 ||
-                    strncmp(line, "Reshape", 7) == 0)
-                    outputName = lastBlobToken(s);
-            }
-            fclose(f);
-        }
-        if (inputName.empty())  inputName  = "images";
-        if (outputName.empty()) outputName = "output";
-        printf("Input layer:  \"%s\"\n", inputName.c_str());
-        printf("Output layer: \"%s\"\n\n", outputName.c_str());
-    }
-
     // ── LibcameraCapture ──────────────────────────────────────────────────────
 
     LibcameraCapture cam;
@@ -390,21 +327,8 @@ int main(int argc, char* argv[]) {
         // Inference/tracking/saving only when capturing
         if (!g_capturing.load(std::memory_order_relaxed)) return;
 
-        // Inference
-        ncnn::Extractor ex = net.create_extractor();
-        ex.input(inputName.c_str(), frame.modelInput);
-
-        ncnn::Mat output;
-        if (ex.extract(outputName.c_str(), output) != 0) {
-            fprintf(stderr, "[warn] extract() failed\n");
-            return;
-        }
-
-        // Decode
-        std::vector<Detection> dets = decoder.decode(
-            output,
-            frame.width, frame.height,
-            frame.scale, frame.padLeft, frame.padTop);
+        // Inference is RKNN-only — not available on this target
+        std::vector<Detection> dets;
 
         // Track
         std::vector<TrackedObject> tracked = tracker.update(dets);

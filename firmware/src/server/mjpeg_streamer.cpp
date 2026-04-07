@@ -6,11 +6,7 @@
 #include "../common/stb_image_write.h"
 #pragma GCC diagnostic pop
 
-// ncnn NV12→RGB: BT.601 limited-range, NEON-optimised on ARM.
-// Same function used by libcamera_capture and crop_saver — consistent colour
-// across all three paths.  Replaces the hand-rolled loop which produced
-// incorrect colours (wrong coefficients, UV range issue).
-#include "ncnn/mat.h"
+#include "../common/imgproc.h"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -257,10 +253,8 @@ std::vector<uint8_t> MjpegStreamer::encodeFrame(
     // ── 1. NV12 → packed RGB ──────────────────────────────────────────────────
     // nv12 is compact (no stride padding): Y plane (srcW*srcH bytes) followed
     // by interleaved UV plane (srcW*srcH/2 bytes).
-    // ncnn::yuv420sp2rgb_nv12 handles BT.601 limited-range correctly and is
-    // NEON-optimised on ARM.
     std::vector<uint8_t> rgb(static_cast<size_t>(srcW * srcH * 3));
-    ncnn::yuv420sp2rgb_nv12(nv12.data(), srcW, srcH, rgb.data());
+    nv12_to_rgb_u8(nv12.data(), srcW, srcH, rgb.data());
 
     // ── 1b. Software white-balance correction ──────────────────────────────────
     // The ISP runs without rkaiq AWB/CCM on RV1106, so the raw NV12 has a strong
@@ -269,7 +263,7 @@ std::vector<uint8_t> MjpegStreamer::encodeFrame(
     //   R ×1.80,  G ×1.00,  B ×1.55
     // Clamped to [0,255].  Applied only to the stream JPEG, not to model input.
     {
-        const float kR = 1.80f, kG = 1.00f, kB = 1.55f;
+        const float kR = m_cfg.wbR, kG = m_cfg.wbG, kB = m_cfg.wbB;
         uint8_t* p = rgb.data();
         const uint8_t* end = p + static_cast<size_t>(srcW * srcH * 3);
         while (p < end) {

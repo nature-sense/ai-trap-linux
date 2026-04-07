@@ -1,5 +1,4 @@
 #include "decoder.h"
-#include "ncnn/mat.h"
 
 #include <algorithm>
 #include <cmath>
@@ -44,14 +43,14 @@ YoloDecoder::YoloDecoder(const DecoderConfig& cfg) : m_cfg(cfg) {}
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::vector<Detection> YoloDecoder::decode(
-    const ncnn::Mat& out,
+    const FloatMat& out,
     int   srcW,    int srcH,
     float scale,
     int   padLeft, int padTop) const
 {
     if (out.dims == 3) {
         // Squeeze batch dim: [1, rows, cols] → [rows, cols]
-        ncnn::Mat sq = out.reshape(out.w, out.h);
+        FloatMat sq = out.reshape(out.w, out.h);
         return dispatch(sq, srcW, srcH, scale, padLeft, padTop);
     }
     if (out.dims != 2) {
@@ -79,7 +78,7 @@ std::vector<Detection> YoloDecoder::decode(
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::vector<Detection> YoloDecoder::dispatch(
-    const ncnn::Mat& out,
+    const FloatMat& out,
     int srcW, int srcH, float scale, int padLeft, int padTop) const
 {
     // ── Forced format ─────────────────────────────────────────────────────────
@@ -171,7 +170,7 @@ std::vector<Detection> YoloDecoder::dispatch(
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::vector<Detection> YoloDecoder::decodeAnchorGrid(
-    const ncnn::Mat& out,
+    const FloatMat& out,
     int srcW, int srcH, float scale, int padLeft, int padTop) const
 {
     const int numAnchors = out.w;
@@ -233,7 +232,7 @@ std::vector<Detection> YoloDecoder::decodeAnchorGrid(
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::vector<Detection> YoloDecoder::decodeEndToEnd(
-    const ncnn::Mat& out,
+    const FloatMat& out,
     int srcW, int srcH, float scale, int padLeft, int padTop) const
 {
     const int  fmtB       = 4 + m_cfg.numClasses + (m_cfg.numClasses > 1 ? 1 : 0);
@@ -314,7 +313,7 @@ std::vector<Detection> YoloDecoder::decodeEndToEnd(
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::vector<Detection> YoloDecoder::decodeDFL(
-    const ncnn::Mat& out,
+    const FloatMat& out,
     int srcW, int srcH, float scale, int padLeft, int padTop) const
 {
     static constexpr int reg_max = 16;
@@ -453,7 +452,7 @@ std::vector<Detection> YoloDecoder::nms(std::vector<Detection> dets) const {
 //  debugTensor
 // ─────────────────────────────────────────────────────────────────────────────
 
-void YoloDecoder::debugTensor(const ncnn::Mat& out, int maxRows) const {
+void YoloDecoder::debugTensor(const FloatMat& out, int maxRows) const {
     printf("YoloDecoder::debugTensor  dims=%d  w=%d  h=%d  c=%d  elemsize=%zu\n",
            out.dims, out.w, out.h, out.c, out.elemsize);
 

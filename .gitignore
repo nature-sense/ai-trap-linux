@@ -20,3 +20,12 @@ package/bin/
 package/lib/
 package/models/
 package/share/
+
+# Luckfox OS firmware images (large binaries — download via scripts/luckfox-firmware-fetch.sh)
+luckfox/system/
+
+# ESP32-P4 / ESP-IDF generated files
+firmware-esp32p4/build/
+firmware-esp32p4/managed_components/
+firmware-esp32p4/sdkconfig
+firmware-esp32p4/.cache/

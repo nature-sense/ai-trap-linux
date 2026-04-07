@@ -49,6 +49,10 @@ bool RknnInference::init(const std::string& modelPath, int inputW, int inputH)
 
 bool RknnInference::lazyInitCtx()
 {
+    if (m_totalRecoveries > 0)
+        fprintf(stderr, "[rknn] reinitialising NPU context (recovery #%d)...\n",
+                m_totalRecoveries);
+
     rknn_context ctx = 0;
     int ret = rknn_init(&ctx,
                         static_cast<void*>(m_modelBytes.data()),
@@ -139,7 +143,7 @@ bool RknnInference::lazyInitCtx()
     fprintf(stderr, "] size=%u size_with_stride=%u scale=%.6f zp=%d\n",
             out_attr.size, out_attr.size_with_stride, out_attr.scale, (int)out_attr.zp);
 
-    // Map tensor dims to (h, w) for ncnn::Mat(w, h).
+    // Map tensor dims to (h, w) for FloatMat(w, h).
     // Expected shapes after RKNN conversion of yolo11n:
     //   3D: [1, 5, 2100]  →  h=5,  w=2100
     //   2D: [5, 2100]     →  h=5,  w=2100
@@ -179,8 +183,12 @@ bool RknnInference::lazyInitCtx()
     }
     fprintf(stderr, "[rknn] output DMA mem: virt=%p size=%u\n",
             m_outputMem->virt_addr, out_mem_sz);
-    fprintf(stderr, "[rknn] ready — output ncnn::Mat(%d, %d)  scale=%.6f zp=%d\n",
-            m_outW, m_outH, m_outScale, m_outZp);
+    if (m_totalRecoveries > 0)
+        fprintf(stderr, "[rknn] reinit complete — NPU context restored (recovery #%d)\n",
+                m_totalRecoveries);
+    else
+        fprintf(stderr, "[rknn] ready — output FloatMat(%d, %d)  scale=%.6f zp=%d\n",
+                m_outW, m_outH, m_outScale, m_outZp);
 
     return true;
 }
@@ -189,7 +197,7 @@ bool RknnInference::lazyInitCtx()
 //  infer
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool RknnInference::infer(const float* inputCHW, ncnn::Mat& out)
+bool RknnInference::infer(const float* inputCHW, FloatMat& out)
 {
     if (!m_ctx && m_readyToInit) {
         if (!lazyInitCtx()) return false;
@@ -222,9 +230,26 @@ bool RknnInference::infer(const float* inputCHW, ncnn::Mat& out)
 
     int ret = rknn_run(ctx, nullptr);
     if (ret < 0) {
-        fprintf(stderr, "[rknn] rknn_run failed: %d\n", ret);
+        m_consecutiveFailures++;
+        m_totalRecoveries++;
+        fprintf(stderr,
+            "[rknn] rknn_run failed: %d  (consecutive=%d  total_recoveries=%d)\n"
+            "[rknn] tearing down context — will reinitialise on next frame\n",
+            ret, m_consecutiveFailures, m_totalRecoveries);
+
+        // Tear down the current context and DMA buffers, but keep m_modelBytes
+        // intact so lazyInitCtx() can recreate everything on the next infer() call.
+        // The NPU kernel driver performs a soft reset after each timeout, so
+        // rknn_init() typically succeeds immediately after this.
+        if (m_outputMem) { rknn_destroy_mem(ctx, m_outputMem); m_outputMem = nullptr; }
+        if (m_inputMem)  { rknn_destroy_mem(ctx, m_inputMem);  m_inputMem  = nullptr; }
+        rknn_destroy(ctx);
+        m_ctx         = 0;
+        m_outBuf.clear();
+        m_readyToInit = true;   // triggers lazyInitCtx() on next infer()
         return false;
     }
+    m_consecutiveFailures = 0; // successful inference — reset streak counter
 
     // Dequantize INT8 output → float32.
     // Affine: float = (int8 - zp) * scale
@@ -236,7 +261,7 @@ bool RknnInference::infer(const float* inputCHW, ncnn::Mat& out)
             m_outBuf[i] = (static_cast<int32_t>(src[i]) - zp) * sc;
     }
 
-    out = ncnn::Mat(m_outW, m_outH, static_cast<void*>(m_outBuf.data()), sizeof(float));
+    out = FloatMat(m_outW, m_outH, m_outBuf.data());
     return true;
 }
 
