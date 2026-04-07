@@ -101,6 +101,11 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+    // Line-buffer stdout so printf output appears immediately in log files.
+    // By default stdout is fully-buffered when not connected to a TTY, which
+    // causes stats and detection output to disappear into the buffer.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+
     const char* rknnFile = argc > 1 ? argv[1] : "model.rknn";
     const char* dbPath   = argc > 2 ? argv[2] : "detections.db";
     const char* cropsDir = argc > 3 ? argv[3] : "crops";
@@ -198,35 +203,32 @@ int main(int argc, char* argv[]) {
     }
     http.setWifiManager(&wifi);
 
-    // ── RKNN model ────────────────────────────────────────────────────────────
+    // ── RKNN model (load bytes only — context created in inference thread) ───────
     RknnInference net;
     if (!net.init(rknnFile, decCfg.modelWidth, decCfg.modelHeight)) {
         db.close(); return 1;
     }
-    printf("RKNN model ready (NPU context deferred to inference thread)\n\n");
 
-    // ── RKMPI capture ─────────────────────────────────────────────────────────
+    // ── Inference thread ──────────────────────────────────────────────────────
     //
-    // NOTE: rkipc must be stopped before this point.  S99trap should call
-    // `/etc/init.d/S21appinit stop` (which stops rkipc) before starting
-    // yolo_rkmpi.  The ISP runs with static defaults from the device tree
-    // — same colour quality as the V4L2 build (green tint without AWB).
+    // IMPORTANT: the inference thread is started and the RKNN context is
+    // fully initialised HERE — BEFORE RkmpiCapture::open() — to prevent a
+    // hard reset caused by simultaneous DMA allocation:
     //
-    // TODO: Load IQ files via rk_aiq without starting rkaiq_3A_server to
-    //       restore AWB/CCM without triggering the NPU AXI DMA conflict.
-    RkmpiCapture cam;
+    //   rknn_init() + rknn_create_mem()  allocate DMA-coherent buffers via
+    //   the NPU kernel driver.  RK_MPI_VI_EnableChn() / StreamOn similarly
+    //   allocate large NV12 DMA buffers for the ISP pipeline.  When both
+    //   run concurrently on the RV1106 AXI bus the system hard-resets.
+    //
+    //   Sequencing: RKNN DMA alloc → complete → RKMPI DMA alloc → streaming.
+    //
+    // Threading contract (librknnmrt same-thread requirement):
+    //   rknn_init() and all subsequent rknn_run() calls must happen in the
+    //   same thread.  eagerInit() is called here so the context lives
+    //   entirely in this thread.
 
-    cam.setErrorCallback([](const std::string& msg) {
-        fprintf(stderr, "[camera] %s\n", msg.c_str());
-    });
-
-    // Enqueue frames from the capture dispatch thread into the inference queue.
-    // The capture dispatch thread does NV12→RGB(320×320) + float conversion
-    // (~0.6 ms) then returns immediately — it does NOT call rknn_run.
-    cam.setCallback([&](const CaptureFrame& frame) {
-        inferQueue.push(frame);
-    });
-
+    // camCfg declared here so the inference thread lambda can capture it by ref
+    // (the thread uses it to scale detection boxes to stream resolution).
     RkmpiConfig camCfg;
     camCfg.captureWidth  = 1920;
     camCfg.captureHeight = 1080;
@@ -237,22 +239,21 @@ int main(int argc, char* argv[]) {
     camCfg.streamWidth   = 640;
     camCfg.streamHeight  = 480;
 
-    try { cam.open(camCfg); }
-    catch (const std::exception& e) {
-        fprintf(stderr, "Fatal: %s\n", e.what());
-        db.close(); return 1;
-    }
+    std::mutex              rknnReadyMtx;
+    std::condition_variable rknnReadyCV;
+    bool                    rknnReady = false;
+    bool                    rknnInitOk = false;
 
-    // ── Inference thread ──────────────────────────────────────────────────────
-    //
-    // Runs rknn_run independently of the capture path.
-    // While the NPU processes frame N (~15 ms), the capture dispatch thread
-    // is preprocessing frame N+1 (~0.6 ms) — true CPU/NPU overlap.
-    //
-    // Threading contract (librknnmrt same-thread requirement):
-    //   RknnInference::lazyInitCtx() is called on the first infer() here,
-    //   so the RKNN context lives entirely in this thread.
     std::thread inferThread([&]() {
+        // Initialise NPU context before any RKMPI DMA begins.
+        rknnInitOk = net.eagerInit();
+        {
+            std::lock_guard<std::mutex> lk(rknnReadyMtx);
+            rknnReady = true;
+        }
+        rknnReadyCV.notify_one();
+        if (!rknnInitOk) return;   // main thread will detect and exit
+
         CaptureFrame frame;
         while (inferQueue.pop(frame)) {
             // NPU inference
@@ -331,13 +332,53 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    // ── Start capture ─────────────────────────────────────────────────────────
+    // ── Wait for RKNN context to be ready ────────────────────────────────────
+    {
+        std::unique_lock<std::mutex> lk(rknnReadyMtx);
+        rknnReadyCV.wait(lk, [&]{ return rknnReady; });
+    }
+    if (!rknnInitOk) {
+        fprintf(stderr, "Fatal: RKNN eager init failed — aborting before RKMPI start\n");
+        inferQueue.stop();
+        if (inferThread.joinable()) inferThread.join();
+        http.close(); sse.close(); streamer.close();
+        crops.close(); db.close();
+        return 1;
+    }
+    printf("RKNN NPU context ready — starting RKMPI capture\n\n");
+
+    // ── RKMPI capture ─────────────────────────────────────────────────────────
+    //
+    // Opened AFTER RKNN context is fully initialised to avoid simultaneous
+    // DMA allocation on the RV1106 AXI bus (see inference thread comment above).
+    //
+    // NOTE: rkipc must be stopped before this point.  S99trap-rkmpi calls
+    // `/etc/init.d/S21appinit stop` before starting yolo_rkmpi.
+    RkmpiCapture cam;
+
+    cam.setErrorCallback([](const std::string& msg) {
+        fprintf(stderr, "[camera] %s\n", msg.c_str());
+    });
+
+    cam.setCallback([&](const CaptureFrame& frame) {
+        inferQueue.push(frame);
+    });
+
+    try { cam.open(camCfg); }
+    catch (const std::exception& e) {
+        fprintf(stderr, "Fatal: %s\n", e.what());
+        inferQueue.stop();
+        if (inferThread.joinable()) inferThread.join();
+        http.close(); sse.close(); streamer.close();
+        crops.close(); db.close();
+        return 1;
+    }
+
     cam.start();
     printf("Running — Ctrl+C to stop\n\n");
 
     // ── Main stats loop ───────────────────────────────────────────────────────
     auto lastStats    = std::chrono::steady_clock::now();
-    auto startTime    = lastStats;
     uint64_t lastFrameCount = 0;
 
     while (!g_stop.load() && cam.isRunning()) {

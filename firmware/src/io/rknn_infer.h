@@ -62,11 +62,19 @@ public:
     // Returns false on failure.
     bool infer(const float* inputCHW, FloatMat& out);
 
+    // Explicitly create the RKNN context in the calling thread.
+    // Must be called from the same thread that will call infer().
+    // Optional — infer() calls this automatically on first use if skipped.
+    // In the RKMPI pipeline, call this BEFORE starting RKMPI capture to avoid
+    // simultaneous DMA allocation (rknn_create_mem + RKMPI VI DMA) which
+    // causes a hard reset on RV1106.
+    bool eagerInit() { return lazyInitCtx(); }
+
     void deinit();
 
 private:
-    // Called on the first infer() to create the RKNN context in the
-    // inference thread (mini-runtime requires same-thread init + run).
+    // Called on the first infer() (or via eagerInit()) to create the RKNN
+    // context in the inference thread (mini-runtime requires same-thread init + run).
     bool lazyInitCtx();
 
     std::string           m_modelPath;           // path stored for logging
