@@ -68,6 +68,11 @@ public:
     // frameW/H: capture dimensions (will be scaled to streamWidth/Height)
     void pushFrame(const std::vector<uint8_t>& nv12, int frameW, int frameH);
 
+    // Push a pre-encoded JPEG directly (e.g. from RKMPI VENC hardware encoder).
+    // Skips all software encode/scale steps — the caller owns the JPEG buffer
+    // and it only needs to remain valid for the duration of this call.
+    void pushJpeg(const uint8_t* data, size_t len);
+
     // Drain and stop all threads, close socket.
     void close();
 

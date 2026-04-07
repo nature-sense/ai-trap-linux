@@ -6,9 +6,11 @@
 #include <rk_mpi_sys.h>
 #include <rk_mpi_vi.h>
 #include <rk_mpi_vpss.h>
+#include <rk_mpi_venc.h>
 #include <rk_mpi_mb.h>
 #include <rk_comm_vi.h>
 #include <rk_comm_vpss.h>
+#include <rk_comm_venc.h>
 #include <rk_comm_video.h>
 
 #include <cerrno>
@@ -18,9 +20,13 @@
 #include <stdexcept>
 
 // ── VPSS channel assignments ──────────────────────────────────────────────────
-static constexpr VPSS_GRP  VPSS_GRP_ID  = 0;
-static constexpr VPSS_CHN  VPSS_CHN_INF = 0;   // inference resolution (320×320)
-static constexpr VPSS_CHN  VPSS_CHN_STR = 1;   // stream resolution    (640×480)
+static constexpr VPSS_GRP  VPSS_GRP_ID   = 0;
+static constexpr VPSS_CHN  VPSS_CHN_INF  = 0;  // inference resolution (320×320)
+static constexpr VPSS_CHN  VPSS_CHN_STR  = 1;  // stream res (640×480) → bound to VENC
+static constexpr VPSS_CHN  VPSS_CHN_FULL = 2;  // full-res passthrough (1920×1080)
+
+// ── VENC channel ──────────────────────────────────────────────────────────────
+static constexpr int       VENC_CHN_ID   = 0;  // MJPEG hardware encoder
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Helpers
@@ -64,11 +70,13 @@ void RkmpiCapture::open(const RkmpiConfig& cfg)
     initVI();
     initVPSS();
     bindVItoVPSS();
+    initVENC();
 
-    fprintf(stderr, "[rkmpi] pipeline ready  VI %dx%d → VPSS inf=%dx%d str=%dx%d\n",
+    fprintf(stderr, "[rkmpi] pipeline ready  VI %dx%d → VPSS inf=%dx%d str=%dx%d(VENC) full=%dx%d\n",
             cfg.captureWidth, cfg.captureHeight,
             cfg.modelWidth,  cfg.modelHeight,
-            cfg.streamWidth, cfg.streamHeight);
+            cfg.streamWidth, cfg.streamHeight,
+            cfg.captureWidth, cfg.captureHeight);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,7 +170,9 @@ void RkmpiCapture::initVPSS()
     check(RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, VPSS_CHN_INF, &infAttr), "VPSS_SetChnAttr(inf)");
     check(RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, VPSS_CHN_INF), "VPSS_EnableChn(inf)");
 
-    // ── Channel 1 — stream (640×480) ──
+    // ── Channel 1 — stream (640×480), bound to VENC ──
+    // u32Depth=0: frame ownership passes to the bind target (VENC).
+    // Do NOT call GetChnFrame on this channel.
     VPSS_CHN_ATTR_S strAttr{};
     strAttr.enChnMode       = VPSS_CHN_MODE_USER;
     strAttr.enDynamicRange  = DYNAMIC_RANGE_SDR8;
@@ -170,18 +180,34 @@ void RkmpiCapture::initVPSS()
     strAttr.enCompressMode  = COMPRESS_MODE_NONE;
     strAttr.u32Width        = static_cast<RK_U32>(m_cfg.streamWidth);
     strAttr.u32Height       = static_cast<RK_U32>(m_cfg.streamHeight);
-    strAttr.u32Depth        = 1;
+    strAttr.u32Depth        = 0;   // bind mode — VENC consumes frames
     strAttr.stFrameRate.s32SrcFrameRate = -1;
     strAttr.stFrameRate.s32DstFrameRate = -1;
     check(RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, VPSS_CHN_STR, &strAttr), "VPSS_SetChnAttr(str)");
     check(RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, VPSS_CHN_STR), "VPSS_EnableChn(str)");
 
+    // ── Channel 2 — full-res passthrough (1920×1080) for crop saving ──
+    VPSS_CHN_ATTR_S fullAttr{};
+    fullAttr.enChnMode       = VPSS_CHN_MODE_USER;
+    fullAttr.enDynamicRange  = DYNAMIC_RANGE_SDR8;
+    fullAttr.enPixelFormat   = RK_FMT_YUV420SP;
+    fullAttr.enCompressMode  = COMPRESS_MODE_NONE;
+    fullAttr.u32Width        = static_cast<RK_U32>(m_cfg.captureWidth);
+    fullAttr.u32Height       = static_cast<RK_U32>(m_cfg.captureHeight);
+    fullAttr.u32Depth        = 1;   // GetChnFrame polling
+    fullAttr.stFrameRate.s32SrcFrameRate = -1;
+    fullAttr.stFrameRate.s32DstFrameRate = -1;
+    fullAttr.stAspectRatio.enMode = ASPECT_RATIO_NONE;  // no scaling, passthrough
+    check(RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, VPSS_CHN_FULL, &fullAttr), "VPSS_SetChnAttr(full)");
+    check(RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, VPSS_CHN_FULL), "VPSS_EnableChn(full)");
+
     check(RK_MPI_VPSS_StartGrp(VPSS_GRP_ID), "VPSS_StartGrp");
 
-    fprintf(stderr, "[rkmpi] VPSS grp=%d  chn0=%dx%d(inf)  chn1=%dx%d(str)\n",
+    fprintf(stderr, "[rkmpi] VPSS grp=%d  chn0=%dx%d(inf)  chn1=%dx%d(str→VENC)  chn2=%dx%d(full)\n",
             VPSS_GRP_ID,
-            m_cfg.modelWidth, m_cfg.modelHeight,
-            m_cfg.streamWidth, m_cfg.streamHeight);
+            m_cfg.modelWidth,   m_cfg.modelHeight,
+            m_cfg.streamWidth,  m_cfg.streamHeight,
+            m_cfg.captureWidth, m_cfg.captureHeight);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -208,6 +234,48 @@ void RkmpiCapture::bindVItoVPSS()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  initVENC — MJPEG hardware encoder bound to VPSS chn1
+// ─────────────────────────────────────────────────────────────────────────────
+
+void RkmpiCapture::initVENC()
+{
+    VENC_CHN_ATTR_S attr{};
+    attr.stVencAttr.enType          = RK_VIDEO_ID_MJPEG;
+    attr.stVencAttr.enPixelFormat   = RK_FMT_YUV420SP;  // NV12 from VPSS
+    attr.stVencAttr.u32MaxPicWidth  = static_cast<RK_U32>(m_cfg.streamWidth);
+    attr.stVencAttr.u32MaxPicHeight = static_cast<RK_U32>(m_cfg.streamHeight);
+    attr.stVencAttr.u32PicWidth     = static_cast<RK_U32>(m_cfg.streamWidth);
+    attr.stVencAttr.u32PicHeight    = static_cast<RK_U32>(m_cfg.streamHeight);
+    // Output buffer: generous allocation; MJPEG at q75 for 640×480 is ~30–80 KB.
+    attr.stVencAttr.u32BufSize      = static_cast<RK_U32>(m_cfg.streamWidth *
+                                                           m_cfg.streamHeight * 2);
+    attr.stVencAttr.u32StreamBufCnt = 4;
+    attr.stVencAttr.bByFrame        = RK_TRUE;  // one GetStream per frame
+    attr.stRcAttr.enRcMode          = VENC_RC_MODE_MJPEGFIXQP;
+    attr.stRcAttr.stMjpegFixQp.u32Qfactor = static_cast<RK_U32>(m_cfg.jpegQuality);
+
+    check(RK_MPI_VENC_CreateChn(VENC_CHN_ID, &attr), "VENC_CreateChn");
+    check(RK_MPI_VENC_StartRecvFrame(VENC_CHN_ID, nullptr), "VENC_StartRecvFrame");
+
+    // Bind VPSS chn1 (stream) → VENC chn0
+    MPP_CHN_S src{};
+    src.enModId  = RK_ID_VPSS;
+    src.s32DevId = VPSS_GRP_ID;
+    src.s32ChnId = VPSS_CHN_STR;
+
+    MPP_CHN_S dst{};
+    dst.enModId  = RK_ID_VENC;
+    dst.s32DevId = 0;
+    dst.s32ChnId = VENC_CHN_ID;
+
+    check(RK_MPI_SYS_Bind(&src, &dst), "SYS_Bind(VPSS→VENC)");
+
+    m_vencInitialised = true;
+    fprintf(stderr, "[rkmpi] VENC chn=%d  MJPEG %dx%d  Qfactor=%d\n",
+            VENC_CHN_ID, m_cfg.streamWidth, m_cfg.streamHeight, m_cfg.jpegQuality);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  start / stop / teardown
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -218,6 +286,8 @@ void RkmpiCapture::start()
     m_running.store(true);
     m_fetchThread    = std::thread(&RkmpiCapture::fetchLoop,    this);
     m_dispatchThread = std::thread(&RkmpiCapture::dispatchLoop, this);
+    if (m_vencInitialised)
+        m_vencThread = std::thread(&RkmpiCapture::vencLoop, this);
 }
 
 void RkmpiCapture::stop()
@@ -226,15 +296,36 @@ void RkmpiCapture::stop()
     m_running.store(false);
     m_queueCv.notify_all();
 
+    // Stop VENC receive so vencLoop's GetStream call unblocks and exits.
+    if (m_vencInitialised)
+        RK_MPI_VENC_StopRecvFrame(VENC_CHN_ID);
+
     if (m_fetchThread.joinable())    m_fetchThread.join();
     if (m_dispatchThread.joinable()) m_dispatchThread.join();
+    if (m_vencThread.joinable())     m_vencThread.join();
 
     teardown();
 }
 
 void RkmpiCapture::teardown()
 {
-    // Unbind VI → VPSS
+    // ── VENC teardown (StopRecvFrame already called in stop()) ────────────────
+    if (m_vencInitialised) {
+        // Unbind VPSS chn1 → VENC
+        MPP_CHN_S vsrc{};
+        vsrc.enModId  = RK_ID_VPSS;
+        vsrc.s32DevId = VPSS_GRP_ID;
+        vsrc.s32ChnId = VPSS_CHN_STR;
+        MPP_CHN_S vdst{};
+        vdst.enModId  = RK_ID_VENC;
+        vdst.s32DevId = 0;
+        vdst.s32ChnId = VENC_CHN_ID;
+        RK_MPI_SYS_UnBind(&vsrc, &vdst);
+        RK_MPI_VENC_DestroyChn(VENC_CHN_ID);
+        m_vencInitialised = false;
+    }
+
+    // ── Unbind VI → VPSS ──────────────────────────────────────────────────────
     MPP_CHN_S srcChn{};
     srcChn.enModId  = RK_ID_VI;
     srcChn.s32DevId = m_cfg.viPipe;
@@ -245,13 +336,14 @@ void RkmpiCapture::teardown()
     dstChn.s32ChnId = 0;
     RK_MPI_SYS_UnBind(&srcChn, &dstChn);
 
-    // VPSS teardown
+    // ── VPSS teardown ─────────────────────────────────────────────────────────
+    RK_MPI_VPSS_DisableChn(VPSS_GRP_ID, VPSS_CHN_FULL);
     RK_MPI_VPSS_DisableChn(VPSS_GRP_ID, VPSS_CHN_STR);
     RK_MPI_VPSS_DisableChn(VPSS_GRP_ID, VPSS_CHN_INF);
     RK_MPI_VPSS_StopGrp(VPSS_GRP_ID);
     RK_MPI_VPSS_DestroyGrp(VPSS_GRP_ID);
 
-    // VI teardown
+    // ── VI teardown ───────────────────────────────────────────────────────────
     RK_MPI_VI_DisableChn(m_cfg.viPipe, m_cfg.viChn);
     RK_MPI_VI_StopPipe(m_cfg.viPipe);
     RK_MPI_VI_DisableDev(m_cfg.viDev);
@@ -279,7 +371,7 @@ void RkmpiCapture::fetchLoop()
 
     while (!m_shouldStop.load()) {
         VIDEO_FRAME_INFO_S infFrame{};
-        VIDEO_FRAME_INFO_S strFrame{};
+        VIDEO_FRAME_INFO_S fullFrame{};
 
         // Block up to 1 s for the inference-resolution frame.
         RK_S32 ret = RK_MPI_VPSS_GetChnFrame(VPSS_GRP_ID, VPSS_CHN_INF, &infFrame, 1000);
@@ -289,10 +381,10 @@ void RkmpiCapture::fetchLoop()
             continue;
         }
 
-        // Pull the stream-resolution frame with a short timeout (it should
-        // be ready since it's from the same VI frame).
-        ret = RK_MPI_VPSS_GetChnFrame(VPSS_GRP_ID, VPSS_CHN_STR, &strFrame, 200);
-        bool hasStream = (ret == RK_SUCCESS);
+        // Pull the full-res frame for crops with a short timeout.
+        // (chn1 stream is bound to VENC — not fetched here.)
+        ret = RK_MPI_VPSS_GetChnFrame(VPSS_GRP_ID, VPSS_CHN_FULL, &fullFrame, 200);
+        bool hasFull = (ret == RK_SUCCESS);
 
         // Map virtual addresses and copy NV12 data out.
         RawFrame raw;
@@ -302,15 +394,15 @@ void RkmpiCapture::fetchLoop()
         void* infVirt = RK_MPI_MB_Handle2VirAddr(infFrame.stVFrame.pMbBlk);
         mbToNv12(infVirt, m_cfg.modelWidth, m_cfg.modelHeight, raw.nv12_model);
 
-        if (hasStream) {
-            void* strVirt = RK_MPI_MB_Handle2VirAddr(strFrame.stVFrame.pMbBlk);
-            mbToNv12(strVirt, m_cfg.streamWidth, m_cfg.streamHeight, raw.nv12_stream);
+        if (hasFull) {
+            void* fullVirt = RK_MPI_MB_Handle2VirAddr(fullFrame.stVFrame.pMbBlk);
+            mbToNv12(fullVirt, m_cfg.captureWidth, m_cfg.captureHeight, raw.nv12_fullres);
         }
 
         // Release VPSS buffers immediately — hardware can reuse them.
         RK_MPI_VPSS_ReleaseChnFrame(VPSS_GRP_ID, VPSS_CHN_INF, &infFrame);
-        if (hasStream)
-            RK_MPI_VPSS_ReleaseChnFrame(VPSS_GRP_ID, VPSS_CHN_STR, &strFrame);
+        if (hasFull)
+            RK_MPI_VPSS_ReleaseChnFrame(VPSS_GRP_ID, VPSS_CHN_FULL, &fullFrame);
 
         // Push to one-slot queue.  If dispatch thread is still busy, drop
         // the oldest frame (detector latency > 1 frame period).
@@ -380,18 +472,52 @@ void RkmpiCapture::dispatchLoop()
 
         // ── Build CaptureFrame and fire callback ──────────────────────────────
         CaptureFrame frame;
-        frame.frameId     = raw.frameId;
-        frame.timestampNs = raw.timestampNs;
-        frame.width       = m_cfg.captureWidth;
-        frame.height      = m_cfg.captureHeight;
-        frame.scale       = scale;
-        frame.padLeft     = padLeft;
-        frame.padTop      = padTop;
-        frame.nv12        = std::move(raw.nv12_stream);   // 640×480 for streamer
-        frame.modelInput  = FloatMat(mW, mH, chwBuf.data());
+        frame.frameId      = raw.frameId;
+        frame.timestampNs  = raw.timestampNs;
+        frame.width        = m_cfg.captureWidth;
+        frame.height       = m_cfg.captureHeight;
+        frame.scale        = scale;
+        frame.padLeft      = padLeft;
+        frame.padTop       = padTop;
+        frame.nv12_fullres = std::move(raw.nv12_fullres);  // 1920×1080 for crops
+        frame.modelInput   = FloatMat(mW, mH, chwBuf.data());
 
         if (m_frameCb) m_frameCb(frame);
         ++m_frameCount;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  vencLoop — drain MJPEG stream from VENC and fire JpegCallback
+//
+//  VENC hardware encodes each VPSS chn1 frame (640×480 NV12) into a JPEG.
+//  RK_MPI_VENC_GetStream blocks up to the timeout; on success the JPEG data
+//  lives inside the MB block until ReleaseStream is called.  We fire the
+//  callback while the buffer is still valid, then release.
+// ─────────────────────────────────────────────────────────────────────────────
+
+void RkmpiCapture::vencLoop()
+{
+    while (!m_shouldStop.load()) {
+        VENC_PACK_S   pack{};
+        VENC_STREAM_S stream{};
+        stream.pstPack    = &pack;
+        stream.u32PackCount = 1;
+
+        RK_S32 ret = RK_MPI_VENC_GetStream(VENC_CHN_ID, &stream, 1000);
+        if (ret != RK_SUCCESS) {
+            if (!m_shouldStop.load())
+                fprintf(stderr, "[rkmpi] VENC_GetStream timeout/err: 0x%x\n", (unsigned)ret);
+            continue;
+        }
+
+        if (m_jpegCb && stream.u32PackCount > 0 && pack.u32Len > 0) {
+            auto* data = static_cast<uint8_t*>(
+                RK_MPI_MB_Handle2VirAddr(pack.pMbBlk)) + pack.u32Offset;
+            m_jpegCb(data, pack.u32Len);
+        }
+
+        RK_MPI_VENC_ReleaseStream(VENC_CHN_ID, &stream);
     }
 }
 

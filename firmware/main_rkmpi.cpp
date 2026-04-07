@@ -155,10 +155,9 @@ int main(int argc, char* argv[]) {
 
     // ── MJPEG streamer ────────────────────────────────────────────────────────
     //
-    // Step 2 will replace the software JPEG encode here with RKMPI VENC.
-    // For now the streamer receives 640×480 NV12 from VPSS channel 1
-    // (via CaptureFrame.nv12) instead of the full 1920×1080 NV12 it
-    // received in the V4L2 build — reducing software encode cost ~9×.
+    // RKMPI VENC hardware-encodes each 640×480 VPSS frame into JPEG and fires
+    // JpegCallback (set below on RkmpiCapture).  pushJpeg() bypasses the
+    // software NV12→RGB→scale→encode path — zero CPU cost per frame.
     MjpegStreamer streamer;
     MjpegStreamerConfig streamCfg;
     streamCfg.port         = 9000;
@@ -238,6 +237,7 @@ int main(int argc, char* argv[]) {
     camCfg.modelHeight   = 320;
     camCfg.streamWidth   = 640;
     camCfg.streamHeight  = 480;
+    camCfg.jpegQuality   = 75;
 
     std::mutex              rknnReadyMtx;
     std::condition_variable rknnReadyCV;
@@ -309,25 +309,20 @@ int main(int argc, char* argv[]) {
             if (!records.empty())
                 db.writeBatch(records);
 
-            // Stream — 640×480 NV12 from VPSS channel 1.
-            // Step 2 will replace this with RKMPI VENC hardware MJPEG.
-            if (!frame.nv12.empty())
-                streamer.pushFrame(frame.nv12, camCfg.streamWidth, camCfg.streamHeight);
+            // Streaming is handled by VENC hardware via JpegCallback — no
+            // per-frame CPU work needed here.
 
-            // Crops — use 640×480 NV12 for now (full-res path in Step 2).
+            // Crops — full-res NV12 (1920×1080) from VPSS chn2.
+            // Detection boxes are already in sensor coordinates; no scaling.
             for (const auto& t : tracked) {
                 if (!t.confirmed) continue;
-                // Scale detection box from sensor coords to stream coords
-                const float sx = static_cast<float>(camCfg.streamWidth)  / frame.width;
-                const float sy = static_cast<float>(camCfg.streamHeight) / frame.height;
-                if (!frame.nv12.empty())
-                    crops.submit(frame.nv12,
-                                 camCfg.streamWidth, camCfg.streamHeight,
+                if (!frame.nv12_fullres.empty())
+                    crops.submit(frame.nv12_fullres,
+                                 frame.width, frame.height,
                                  t.trackId, t.classId,
                                  className(t.classId),
                                  t.score,
-                                 t.x1 * sx, t.y1 * sy,
-                                 t.x2 * sx, t.y2 * sy);
+                                 t.x1, t.y1, t.x2, t.y2);
             }
         }
     });
@@ -362,6 +357,12 @@ int main(int argc, char* argv[]) {
 
     cam.setCallback([&](const CaptureFrame& frame) {
         inferQueue.push(frame);
+    });
+
+    // VENC hardware MJPEG: each encoded frame arrives here from the VENC thread.
+    // pushJpeg copies the data into the streamer's frame slot and notifies clients.
+    cam.setJpegCallback([&](const uint8_t* data, size_t len) {
+        streamer.pushJpeg(data, len);
     });
 
     try { cam.open(camCfg); }

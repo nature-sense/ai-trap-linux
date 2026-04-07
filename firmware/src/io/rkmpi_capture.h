@@ -9,8 +9,9 @@
 //  ────────
 //  RKMPI VI (IMX415, NV12, 1920×1080 @ 30 fps)
 //    └─[SYS_Bind]─► VPSS Group 0
-//                      ├─ Chn 0 (320×320 NV12)  ← inference
-//                      └─ Chn 1 (640×480 NV12)  ← MJPEG stream (Step 2)
+//                      ├─ Chn 0 (320×320  NV12)  ← inference (GetChnFrame)
+//                      ├─ Chn 1 (640×480  NV12)  ← [SYS_Bind]─► VENC (MJPEG)
+//                      └─ Chn 2 (1920×1080 NV12) ← full-res crops (GetChnFrame)
 //
 //  Threading
 //  ─────────
@@ -18,12 +19,14 @@
 //  start() — starts the dispatch thread which calls the user callback.
 //  stop()  — stops both threads and tears down RKMPI.
 //
-//  Fetch thread  : RK_MPI_VPSS_GetChnFrame → copy NV12 → release VPSS buffer
-//                  (VPSS buffer released immediately so VPSS is never stalled)
-//                  → push RawFrame to a 1-slot queue (drop oldest).
+//  Fetch thread  : GetChnFrame(chn0 inf) + GetChnFrame(chn2 full) → copy NV12
+//                  → release VPSS buffers immediately → 1-slot queue (drop oldest).
+//                  Chn1 (stream) is bound directly to VENC — not fetched here.
 //
 //  Dispatch thread: pop RawFrame → NV12→RGB(320×320) → letterbox float CHW
 //                   → call FrameCallback.
+//
+//  VENC thread   : RK_MPI_VENC_GetStream → fire JpegCallback → ReleaseStream.
 //
 //  This decouples the 15ms rknn_run from the hardware buffer lifetime so
 //  VPSS can fill the next buffer while the NPU runs on the previous one.
@@ -84,19 +87,22 @@ struct RkmpiConfig {
     int modelWidth  = 320;
     int modelHeight = 320;
 
-    // VPSS output resolution for MJPEG streaming (channel 1).
+    // VPSS output resolution for MJPEG streaming (channel 1, bound to VENC).
     int streamWidth  = 640;
     int streamHeight = 480;
+
+    // VENC MJPEG quality factor (1–99).  Higher = better quality, larger JPEG.
+    int jpegQuality = 75;
 };
 
 // ── Frame delivered to the callback ───────────────────────────────────────────
 
 struct CaptureFrame {
-    // Compact NV12 at streamWidth×streamHeight (from VPSS channel 1).
-    // Used by MjpegStreamer.  Empty until Step 2 wires channel 1.
-    std::vector<uint8_t> nv12;
-    int width  = 0;
-    int height = 0;
+    // Full-resolution compact NV12 (captureWidth×captureHeight, from VPSS chn2).
+    // Used by CropSaver — MJPEG streaming is handled by VENC via JpegCallback.
+    std::vector<uint8_t> nv12_fullres;
+    int width  = 0;   // capture width  (e.g. 1920)
+    int height = 0;   // capture height (e.g. 1080)
 
     // Preprocessed model input: CHW float32 [0,1], modelWidth×modelHeight.
     // Allocated once per frame in the dispatch thread.
@@ -116,6 +122,9 @@ struct CaptureFrame {
 
 using FrameCallback = std::function<void(const CaptureFrame&)>;
 using ErrorCallback = std::function<void(const std::string&)>;
+// Called from the VENC thread with each hardware-encoded JPEG frame.
+// `data` is valid only for the duration of the callback.
+using JpegCallback  = std::function<void(const uint8_t* data, size_t len)>;
 
 class RkmpiCapture {
 public:
@@ -127,6 +136,7 @@ public:
 
     void setCallback(FrameCallback cb)      { m_frameCb = std::move(cb); }
     void setErrorCallback(ErrorCallback cb) { m_errorCb = std::move(cb); }
+    void setJpegCallback(JpegCallback cb)   { m_jpegCb  = std::move(cb); }
 
     // Initialise RKMPI (MPI_SYS_Init, VI, VPSS, bind).
     // Throws std::runtime_error on failure.
@@ -149,16 +159,20 @@ private:
     // ── Dispatch thread: pop queue → preprocess → callback ───────────────────
     void dispatchLoop();
 
+    // ── VENC thread: GetStream → JpegCallback → ReleaseStream ────────────────
+    void vencLoop();
+
     // ── RKMPI setup / teardown ─────────────────────────────────────────────────
     void initVI();
     void initVPSS();
+    void initVENC();
     void bindVItoVPSS();
     void teardown();
 
     // ── One-slot frame queue (drop-oldest) ────────────────────────────────────
     struct RawFrame {
-        std::vector<uint8_t> nv12_model;  // 320×320 compact NV12
-        std::vector<uint8_t> nv12_stream; // 640×480 compact NV12 (Step 2)
+        std::vector<uint8_t> nv12_model;    // 320×320 compact NV12
+        std::vector<uint8_t> nv12_fullres;  // captureW×captureH compact NV12
         uint64_t frameId     = 0;
         uint64_t timestampNs = 0;
     };
@@ -169,12 +183,15 @@ private:
     std::condition_variable  m_queueCv;
 
     // ── State ──────────────────────────────────────────────────────────────────
-    RkmpiConfig  m_cfg;
+    RkmpiConfig   m_cfg;
     FrameCallback m_frameCb;
     ErrorCallback m_errorCb;
+    JpegCallback  m_jpegCb;
 
     std::thread  m_fetchThread;
     std::thread  m_dispatchThread;
+    std::thread  m_vencThread;
+    bool         m_vencInitialised = false;
 
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_shouldStop{false};

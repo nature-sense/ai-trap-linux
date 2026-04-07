@@ -146,6 +146,26 @@ void MjpegStreamer::pushFrame(const std::vector<uint8_t>& nv12,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  pushJpeg()
+// ─────────────────────────────────────────────────────────────────────────────
+
+void MjpegStreamer::pushJpeg(const uint8_t* data, size_t len)
+{
+    if (!m_running.load() || !data || len == 0) return;
+    {
+        std::lock_guard<std::mutex> lk(m_clientMutex);
+        if (m_clients.empty()) return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_frameMutex);
+        m_jpeg.assign(data, data + len);
+        m_frameSeq++;
+    }
+    m_frameCv.notify_all();
+    m_framesPushed++;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  acceptLoop()
 // ─────────────────────────────────────────────────────────────────────────────
 
