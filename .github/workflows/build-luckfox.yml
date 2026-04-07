@@ -9,12 +9,16 @@
 #  1. Toolchain   — sparse-clone the Luckfox SDK, run env_install_toolchain.sh
 #                   Result cached by toolchain commit SHA so re-downloads only
 #                   when Luckfox push a new toolchain.
-#  2. Sysroot     — cross-build SQLite3 + NCNN and install into
-#                   sysroot/luckfox/  Result cached by dep versions so a
-#                   full dep rebuild is only triggered when versions change.
+#  2. Sysroot     — cross-build SQLite3, fetch RKNN mini-runtime + headers,
+#                   install into sysroot/luckfox/  Result cached by dep
+#                   versions so a full rebuild only triggers when they change.
 #  3. App build   — meson + ninja, using a CI-generated cross file that
 #                   substitutes real workspace paths.
 #  4. Artifact    — stripped yolo_v4l2 binary uploaded for 30 days.
+#  5. Release     — on v* tags: bundle binary + models + config + init scripts
+#                   into ai-trap-luckfox-<version>.tar.gz and publish a
+#                   GitHub Release.  Install on device with:
+#                     bash scripts/luckfox-install.sh
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Build · Luckfox Pico Zero
@@ -22,16 +26,18 @@ name: Build · Luckfox Pico Zero
 on:
   push:
     branches: [ main ]
+    tags:     [ 'v*' ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 env:
   CROSS:          arm-rockchip830-linux-uclibcgnueabihf
   TOOLCHAIN_DIR:  ${{ github.workspace }}/toolchain/arm-rockchip830-linux-uclibcgnueabihf
   SYSROOT:        ${{ github.workspace }}/sysroot/luckfox
-  NCNN_VERSION:   20240410
-  SQLITE_VERSION: 3450100
-  SQLITE_YEAR:    2024
+  SQLITE_VERSION: 3510300
+  SQLITE_YEAR:    2026
+  RKNN_VERSION:   v2.3.2
   ARM_FLAGS:      -march=armv7-a -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -O2
 
 jobs:
@@ -110,7 +116,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.SYSROOT }}
-          key: luckfox-sysroot-sqlite${{ env.SQLITE_VERSION }}-ncnn${{ env.NCNN_VERSION }}-v1
+          key: luckfox-sysroot-sqlite${{ env.SQLITE_VERSION }}-rknn${{ env.RKNN_VERSION }}-v1
 
       # ── BlueZ headers ───────────────────────────────────────────────────────
       # Copied from the host libbluetooth-dev package (installed above).
@@ -149,32 +155,21 @@ jobs:
           cd ..
           rm -rf sqlite-autoconf-${{ env.SQLITE_VERSION }}
 
-      - name: Cross-build NCNN
+      - name: Fetch RKNN mini-runtime
         if: steps.cache-sysroot.outputs.cache-hit != 'true'
         run: |
-          GCC="${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}-gcc"
-          GXX="${{ env.TOOLCHAIN_DIR }}/bin/${{ env.CROSS }}-g++"
-          git clone --depth 1 --branch ${{ env.NCNN_VERSION }} \
-            https://github.com/Tencent/ncnn.git ncnn-src
-          cmake -S ncnn-src -B ncnn-build \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_SYSTEM_PROCESSOR=arm \
-            -DCMAKE_C_COMPILER="$GCC" \
-            -DCMAKE_CXX_COMPILER="$GXX" \
-            -DCMAKE_C_FLAGS="${{ env.ARM_FLAGS }}" \
-            -DCMAKE_CXX_FLAGS="${{ env.ARM_FLAGS }}" \
-            -DCMAKE_INSTALL_PREFIX="${{ env.SYSROOT }}/usr" \
-            -DNCNN_TARGET_ARCH=arm \
-            -DNCNN_SHARED_LIB=OFF \
-            -DNCNN_BUILD_TESTS=OFF \
-            -DNCNN_BUILD_EXAMPLES=OFF \
-            -DNCNN_BUILD_TOOLS=OFF \
-            -DNCNN_BUILD_BENCHMARK=OFF \
-            -DNCNN_VULKAN=OFF \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build ncnn-build -j$(nproc)
-          cmake --install ncnn-build
-          rm -rf ncnn-src ncnn-build
+          # RV1106 uses the RKNN mini-runtime (librknnmrt.so), not the full
+          # librknnrt.so (which is for higher-end chips like RK3588).
+          # armhf-uclibc: correct variant for Luckfox Pico Zero (Cortex-A7, uClibc).
+          # VERSION PINNING: must match the toolkit2 version used to convert model.rknn.
+          RKNN_BASE="https://raw.githubusercontent.com/airockchip/rknn-toolkit2/${{ env.RKNN_VERSION }}/rknpu2/runtime/Linux/librknn_api"
+          mkdir -p "${{ env.SYSROOT }}/usr/lib" "${{ env.SYSROOT }}/usr/include"
+          curl -fL "${RKNN_BASE}/armhf-uclibc/librknnmrt.so" \
+               -o "${{ env.SYSROOT }}/usr/lib/librknnmrt.so"
+          curl -fL "${RKNN_BASE}/include/rknn_api.h" \
+               -o "${{ env.SYSROOT }}/usr/include/rknn_api.h"
+          LIB_VER="$(strings "${{ env.SYSROOT }}/usr/lib/librknnmrt.so" | grep 'librknnmrt version:' || true)"
+          echo "librknnmrt.so → ${{ env.SYSROOT }}/usr/lib/  (${LIB_VER})"
 
       # ── Generate cross file with real CI paths ──────────────────────────────
       #
@@ -248,3 +243,89 @@ jobs:
           name: yolo_v4l2-rv1106-${{ github.sha }}
           path: build-luckfox/yolo_v4l2
           retention-days: 30
+
+  # ── Release (v* tags only) ─────────────────────────────────────────────────
+  #
+  # Bundles the binary with model.rknn, librknnmrt.so, production config, and
+  # init scripts into a single tarball and publishes a GitHub Release.
+  # Install on a flashed board with: bash scripts/luckfox-install.sh
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: yolo_v4l2-rv1106-${{ github.sha }}
+          path: dist/
+
+      - name: Fetch RKNN runtime for release bundle
+        run: |
+          RKNN_BASE="https://raw.githubusercontent.com/airockchip/rknn-toolkit2/${{ env.RKNN_VERSION }}/rknpu2/runtime/Linux/librknn_api"
+          curl -fL "${RKNN_BASE}/armhf-uclibc/librknnmrt.so" -o dist/librknnmrt.so
+
+      - name: Build release package
+        run: |
+          VERSION="${{ github.ref_name }}"
+          PKG="ai-trap-luckfox-${VERSION}"
+          mkdir -p "${PKG}"
+
+          # Binary
+          cp dist/yolo_v4l2 "${PKG}/"
+          chmod +x "${PKG}/yolo_v4l2"
+
+          # RKNN model + runtime
+          cp firmware/models/yolo11n-320/model.rknn "${PKG}/"
+          cp dist/librknnmrt.so "${PKG}/"
+
+          # Production config and init scripts
+          cp package/luckfox/trap_config.toml "${PKG}/"
+          cp package/luckfox/S50wifi          "${PKG}/"
+          cp package/luckfox/S99trap          "${PKG}/"
+          chmod +x "${PKG}/S50wifi" "${PKG}/S99trap"
+
+          # Version file
+          echo "${VERSION}" > "${PKG}/VERSION"
+
+          tar -czf "${PKG}.tar.gz" "${PKG}/"
+          echo "## Package contents"   >> release_notes.md
+          echo '```' >> release_notes.md
+          tar -tzf "${PKG}.tar.gz"     >> release_notes.md
+          echo '```' >> release_notes.md
+          echo ""                      >> release_notes.md
+          echo "**Size:** $(du -sh ${PKG}.tar.gz | cut -f1)" >> release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ai-trap Luckfox ${{ github.ref_name }}"
+          body_path: release_notes.md
+          body: |
+            ## Installation
+
+            On a Mac with a freshly flashed Luckfox Pico Zero connected via USB:
+
+            ```bash
+            bash scripts/luckfox-install.sh
+            bash scripts/luckfox-wifi-setup.sh "YourSSID" "YourPassword"
+            ```
+
+            Or run the full end-to-end setup from scratch:
+
+            ```bash
+            bash scripts/luckfox-setup.sh "YourSSID" "YourPassword"
+            ```
+
+            See [luckfox-development-guide.md](docs/luckfox/luckfox-development-guide.md) for full details.
+          files: ai-trap-luckfox-${{ github.ref_name }}.tar.gz
+          fail_on_unmatched_files: true
