@@ -199,7 +199,7 @@ inc = include_directories([
 
 # ── Pi 5 / libcamera target ───────────────────────────────────────────────────
 
-if target_opt == 'libcamera' or target_opt == 'all'
+if target_opt == 'libcamera' or (target_opt == 'all' and not is_arm_cross)
   if not libcamera_dep.found()
     error('target=libcamera requires libcamera. ' +
           'On the Luckfox cross-build host use -Dtarget=v4l2 instead.')
