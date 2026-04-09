@@ -238,6 +238,7 @@ int main(int argc, char* argv[]) {
     camCfg.streamWidth   = 640;
     camCfg.streamHeight  = 480;
     camCfg.jpegQuality   = 75;
+    camCfg.enableVenc    = false;  // hardware VENC (mpp_vcodec) broken on this BSP — use software JPEG
 
     std::mutex              rknnReadyMtx;
     std::condition_variable rknnReadyCV;

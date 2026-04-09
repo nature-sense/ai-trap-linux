@@ -93,6 +93,10 @@ struct RkmpiConfig {
 
     // VENC MJPEG quality factor (1–99).  Higher = better quality, larger JPEG.
     int jpegQuality = 75;
+
+    // Set false to skip VENC init and VPSS chn1 — useful for testing inference
+    // without hardware MJPEG encoding.
+    bool enableVenc = true;
 };
 
 // ── Frame delivered to the callback ───────────────────────────────────────────
@@ -162,8 +166,12 @@ private:
     // ── VENC thread: GetStream → JpegCallback → ReleaseStream ────────────────
     void vencLoop();
 
+    // ── Software JPEG thread: VPSS CHN_STR → NV12→RGB → stb JPEG → callback ──
+    void softwareJpegLoop();
+
     // ── RKMPI setup / teardown ─────────────────────────────────────────────────
     void initVI();
+    void startVI();
     void initVPSS();
     void initVENC();
     void bindVItoVPSS();
@@ -191,6 +199,7 @@ private:
     std::thread  m_fetchThread;
     std::thread  m_dispatchThread;
     std::thread  m_vencThread;
+    std::thread  m_softJpegThread;
     bool         m_vencInitialised = false;
 
     std::atomic<bool> m_running{false};

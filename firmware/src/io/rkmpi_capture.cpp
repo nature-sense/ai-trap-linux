@@ -2,17 +2,20 @@
 #include "imgproc.h"
 #include "float_mat.h"
 
+#include "stb_image_write.h"
+
 // RKMPI headers (from Luckfox SDK: media/rockit/rockit/mpi/sdk/include/)
+#include <rk_mpi_mb.h>
 #include <rk_mpi_sys.h>
 #include <rk_mpi_vi.h>
 #include <rk_mpi_vpss.h>
 #include <rk_mpi_venc.h>
-#include <rk_mpi_mb.h>
 #include <rk_comm_vi.h>
 #include <rk_comm_vpss.h>
 #include <rk_comm_venc.h>
 #include <rk_comm_video.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -63,14 +66,57 @@ void RkmpiCapture::open(const RkmpiConfig& cfg)
 {
     m_cfg = cfg;
 
-    // Global RKMPI init — idempotent if already called by another component,
-    // but since we stopped rkipc this should be the first caller.
+    // ── Static DMA pool pre-allocation ───────────────────────────────────────
+    //
+    // RK_MPI_MB_SetModPoolConfig() tells the RKMPI allocator exactly how much
+    // CMA to reserve per module.  This must be called BEFORE RK_MPI_SYS_Init()
+    // so that all DMA buffers are committed in one shot while the ISP is idle.
+    //
+    // Without this, each module calls mmap() on /dev/mpi individually after the
+    // ISP has started streaming.  The CMA allocator then has to migrate pages
+    // that the ISP DMA has already pinned, which deadlocks inside the kernel
+    // (process enters D-state, unkillable).
+    //
+    // Sizes must match what each module will request:
+    //   VI  : captureWidth × captureHeight × 1.5 (NV12)  × bufferCount
+    //   VPSS: not pre-allocated here — VPSS draws from the VI pool via bind
+    //   VENC: virW × virH × 2 (generous NV12 equivalent)  × streamBufCnt=4
+
+    const RK_U32 virW = static_cast<RK_U32>((cfg.streamWidth  + 15) & ~15);
+    const RK_U32 virH = static_cast<RK_U32>((cfg.streamHeight + 15) & ~15);
+
+    // VI pool: 4 × 1920×1080 NV12
+    {
+        MB_CONFIG_S mbCfg{};
+        mbCfg.astCommPool[0].u64MBSize   = static_cast<RK_U64>(cfg.captureWidth)
+                                         * cfg.captureHeight * 3 / 2;
+        mbCfg.astCommPool[0].u32MBCnt    = static_cast<RK_U32>(cfg.bufferCount);
+        mbCfg.astCommPool[0].enAllocType = MB_ALLOC_TYPE_DMA;
+        check(RK_MPI_MB_SetModPoolConfig(MB_UID_VI, &mbCfg), "MB_SetModPoolConfig(VI)");
+    }
+
+    if (cfg.enableVenc) {
+        MB_CONFIG_S mbCfg{};
+        mbCfg.astCommPool[0].u64MBSize   = static_cast<RK_U64>(virW) * virH * 2;
+        mbCfg.astCommPool[0].u32MBCnt    = 4;  // streamBufCnt
+        mbCfg.astCommPool[0].enAllocType = MB_ALLOC_TYPE_DMA;
+        check(RK_MPI_MB_SetModPoolConfig(MB_UID_VENC, &mbCfg), "MB_SetModPoolConfig(VENC)");
+    }
+
+    // When VENC is active, reduce VI buffer count 4→2 to free ~6 MB of CMA.
+    // VENC mmap() needs contiguous CMA; fewer VI buffers means less migration
+    // pressure when the VEPU driver allocates its ring buffer.
+    if (cfg.enableVenc) m_cfg.bufferCount = std::min(m_cfg.bufferCount, 2);
+
+    // Global RKMPI init — commits all module pool allocations in one CMA call.
     check(RK_MPI_SYS_Init(), "RK_MPI_SYS_Init");
 
-    initVI();
-    initVPSS();
+    initVI();        // configure VI dev/pipe/channel
+    startVI();       // VI_EnableChn → ispStreamOn (VENC mmap requires ISP running)
+    initVPSS();      // configure VPSS group + channels (CHN_FULL skipped if enableVenc)
+    check(RK_MPI_VPSS_StartGrp(VPSS_GRP_ID), "VPSS_StartGrp");
+    if (cfg.enableVenc) initVENC();  // VENC after ISP but with reduced CMA pressure
     bindVItoVPSS();
-    initVENC();
 
     fprintf(stderr, "[rkmpi] pipeline ready  VI %dx%d → VPSS inf=%dx%d str=%dx%d(VENC) full=%dx%d\n",
             cfg.captureWidth, cfg.captureHeight,
@@ -111,7 +157,8 @@ void RkmpiCapture::initVI()
     // ── Pipe ──
     check(RK_MPI_VI_StartPipe(pipe), "VI_StartPipe");
 
-    // ── Channel ──
+    // ── Channel attr (no EnableChn yet — ISP DMA must not start until after
+    //    VENC ring buffer is allocated; see startVI()) ──
     //
     // u32Depth = 0: VI channel is bound to VPSS — frame ownership passes to
     // the bind pipeline.  Setting depth > 0 in bind mode over-allocates
@@ -125,11 +172,24 @@ void RkmpiCapture::initVI()
     chnAttr.enCompressMode          = COMPRESS_MODE_NONE;
     chnAttr.u32Depth                = 0;   // bind mode — do not set > 0
     check(RK_MPI_VI_SetChnAttr(pipe, chn, &chnAttr), "VI_SetChnAttr");
-    check(RK_MPI_VI_EnableChn(pipe, chn), "VI_EnableChn");
 
     fprintf(stderr, "[rkmpi] VI dev=%d pipe=%d chn=%d  %dx%d NV12 bufs=%d\n",
             dev, pipe, chn,
             m_cfg.captureWidth, m_cfg.captureHeight, m_cfg.bufferCount);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  startVI — enables the VI channel, which triggers ispStreamOn (ISP DMA start)
+//
+//  Called after VENC_CreateChn so the VEPU driver can allocate its ring buffer
+//  from CMA while the ISP is still idle.  EnableChn is the only VI call that
+//  touches the ISP DMA engine; everything before it is pure configuration.
+// ─────────────────────────────────────────────────────────────────────────────
+
+void RkmpiCapture::startVI()
+{
+    check(RK_MPI_VI_EnableChn(m_cfg.viPipe, m_cfg.viChn), "VI_EnableChn");
+    fprintf(stderr, "[rkmpi] VI streaming started\n");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,38 +230,47 @@ void RkmpiCapture::initVPSS()
     check(RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, VPSS_CHN_INF, &infAttr), "VPSS_SetChnAttr(inf)");
     check(RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, VPSS_CHN_INF), "VPSS_EnableChn(inf)");
 
-    // ── Channel 1 — stream (640×480), bound to VENC ──
-    // u32Depth=0: frame ownership passes to the bind target (VENC).
-    // Do NOT call GetChnFrame on this channel.
-    VPSS_CHN_ATTR_S strAttr{};
-    strAttr.enChnMode       = VPSS_CHN_MODE_USER;
-    strAttr.enDynamicRange  = DYNAMIC_RANGE_SDR8;
-    strAttr.enPixelFormat   = RK_FMT_YUV420SP;
-    strAttr.enCompressMode  = COMPRESS_MODE_NONE;
-    strAttr.u32Width        = static_cast<RK_U32>(m_cfg.streamWidth);
-    strAttr.u32Height       = static_cast<RK_U32>(m_cfg.streamHeight);
-    strAttr.u32Depth        = 0;   // bind mode — VENC consumes frames
-    strAttr.stFrameRate.s32SrcFrameRate = -1;
-    strAttr.stFrameRate.s32DstFrameRate = -1;
-    check(RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, VPSS_CHN_STR, &strAttr), "VPSS_SetChnAttr(str)");
-    check(RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, VPSS_CHN_STR), "VPSS_EnableChn(str)");
+    // ── Channel 1 — stream (640×480) ──
+    // enableVenc=true  → depth=0, bound to VENC (hardware MJPEG)
+    // enableVenc=false → depth=1, polled by softwareJpegLoop for software JPEG
+    {
+        VPSS_CHN_ATTR_S strAttr{};
+        strAttr.enChnMode       = VPSS_CHN_MODE_USER;
+        strAttr.enDynamicRange  = DYNAMIC_RANGE_SDR8;
+        strAttr.enPixelFormat   = RK_FMT_YUV420SP;
+        strAttr.enCompressMode  = COMPRESS_MODE_NONE;
+        strAttr.u32Width        = static_cast<RK_U32>(m_cfg.streamWidth);
+        strAttr.u32Height       = static_cast<RK_U32>(m_cfg.streamHeight);
+        strAttr.u32Depth        = m_cfg.enableVenc ? 0 : 1;   // 0=bind, 1=poll
+        strAttr.stFrameRate.s32SrcFrameRate = -1;
+        strAttr.stFrameRate.s32DstFrameRate = -1;
+        check(RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, VPSS_CHN_STR, &strAttr), "VPSS_SetChnAttr(str)");
+        check(RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, VPSS_CHN_STR), "VPSS_EnableChn(str)");
+    }
 
     // ── Channel 2 — full-res passthrough (1920×1080) for crop saving ──
-    VPSS_CHN_ATTR_S fullAttr{};
-    fullAttr.enChnMode       = VPSS_CHN_MODE_USER;
-    fullAttr.enDynamicRange  = DYNAMIC_RANGE_SDR8;
-    fullAttr.enPixelFormat   = RK_FMT_YUV420SP;
-    fullAttr.enCompressMode  = COMPRESS_MODE_NONE;
-    fullAttr.u32Width        = static_cast<RK_U32>(m_cfg.captureWidth);
-    fullAttr.u32Height       = static_cast<RK_U32>(m_cfg.captureHeight);
-    fullAttr.u32Depth        = 1;   // GetChnFrame polling
-    fullAttr.stFrameRate.s32SrcFrameRate = -1;
-    fullAttr.stFrameRate.s32DstFrameRate = -1;
-    fullAttr.stAspectRatio.enMode = ASPECT_RATIO_NONE;  // no scaling, passthrough
-    check(RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, VPSS_CHN_FULL, &fullAttr), "VPSS_SetChnAttr(full)");
-    check(RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, VPSS_CHN_FULL), "VPSS_EnableChn(full)");
+    // Skipped when enableVenc=true: the 1920×1080 VPSS channel allocates ~3 MB
+    // of CMA-backed DMA buffers.  With VI (4×3.1 MB) + VPSS CHN_FULL already
+    // pinning ~15 MB, VENC's mmap() can trigger a CMA migration deadlock.
+    // When VENC is active the CropSaver falls back to the inference-resolution
+    // frame (CHN_INF, 320×320) — adequate for saving detection thumbnails.
+    if (!m_cfg.enableVenc) {
+        VPSS_CHN_ATTR_S fullAttr{};
+        fullAttr.enChnMode       = VPSS_CHN_MODE_USER;
+        fullAttr.enDynamicRange  = DYNAMIC_RANGE_SDR8;
+        fullAttr.enPixelFormat   = RK_FMT_YUV420SP;
+        fullAttr.enCompressMode  = COMPRESS_MODE_NONE;
+        fullAttr.u32Width        = static_cast<RK_U32>(m_cfg.captureWidth);
+        fullAttr.u32Height       = static_cast<RK_U32>(m_cfg.captureHeight);
+        fullAttr.u32Depth        = 1;   // GetChnFrame polling
+        fullAttr.stFrameRate.s32SrcFrameRate = -1;
+        fullAttr.stFrameRate.s32DstFrameRate = -1;
+        fullAttr.stAspectRatio.enMode = ASPECT_RATIO_NONE;  // no scaling, passthrough
+        check(RK_MPI_VPSS_SetChnAttr(VPSS_GRP_ID, VPSS_CHN_FULL, &fullAttr), "VPSS_SetChnAttr(full)");
+        check(RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, VPSS_CHN_FULL), "VPSS_EnableChn(full)");
+    }
 
-    check(RK_MPI_VPSS_StartGrp(VPSS_GRP_ID), "VPSS_StartGrp");
+    // VPSS_StartGrp activates RGA2 DMA — deferred to open() after VENC is ready.
 
     fprintf(stderr, "[rkmpi] VPSS grp=%d  chn0=%dx%d(inf)  chn1=%dx%d(str→VENC)  chn2=%dx%d(full)\n",
             VPSS_GRP_ID,
@@ -239,6 +308,11 @@ void RkmpiCapture::bindVItoVPSS()
 
 void RkmpiCapture::initVENC()
 {
+    // VirWidth/VirHeight must be explicitly set — RKMPI rejects u32VirWidth=0.
+    // Align to 16 bytes (the minimum RGA2/VENC stride requirement on RV1106).
+    const RK_U32 virW = static_cast<RK_U32>((m_cfg.streamWidth  + 15) & ~15);
+    const RK_U32 virH = static_cast<RK_U32>((m_cfg.streamHeight + 15) & ~15);
+
     VENC_CHN_ATTR_S attr{};
     attr.stVencAttr.enType          = RK_VIDEO_ID_MJPEG;
     attr.stVencAttr.enPixelFormat   = RK_FMT_YUV420SP;  // NV12 from VPSS
@@ -246,9 +320,10 @@ void RkmpiCapture::initVENC()
     attr.stVencAttr.u32MaxPicHeight = static_cast<RK_U32>(m_cfg.streamHeight);
     attr.stVencAttr.u32PicWidth     = static_cast<RK_U32>(m_cfg.streamWidth);
     attr.stVencAttr.u32PicHeight    = static_cast<RK_U32>(m_cfg.streamHeight);
+    attr.stVencAttr.u32VirWidth     = virW;
+    attr.stVencAttr.u32VirHeight    = virH;
     // Output buffer: generous allocation; MJPEG at q75 for 640×480 is ~30–80 KB.
-    attr.stVencAttr.u32BufSize      = static_cast<RK_U32>(m_cfg.streamWidth *
-                                                           m_cfg.streamHeight * 2);
+    attr.stVencAttr.u32BufSize      = virW * virH * 2;
     attr.stVencAttr.u32StreamBufCnt = 4;
     attr.stVencAttr.bByFrame        = RK_TRUE;  // one GetStream per frame
     attr.stRcAttr.enRcMode          = VENC_RC_MODE_MJPEGFIXQP;
@@ -288,6 +363,8 @@ void RkmpiCapture::start()
     m_dispatchThread = std::thread(&RkmpiCapture::dispatchLoop, this);
     if (m_vencInitialised)
         m_vencThread = std::thread(&RkmpiCapture::vencLoop, this);
+    else if (m_jpegCb)
+        m_softJpegThread = std::thread(&RkmpiCapture::softwareJpegLoop, this);
 }
 
 void RkmpiCapture::stop()
@@ -300,9 +377,10 @@ void RkmpiCapture::stop()
     if (m_vencInitialised)
         RK_MPI_VENC_StopRecvFrame(VENC_CHN_ID);
 
-    if (m_fetchThread.joinable())    m_fetchThread.join();
-    if (m_dispatchThread.joinable()) m_dispatchThread.join();
-    if (m_vencThread.joinable())     m_vencThread.join();
+    if (m_fetchThread.joinable())      m_fetchThread.join();
+    if (m_dispatchThread.joinable())   m_dispatchThread.join();
+    if (m_vencThread.joinable())       m_vencThread.join();
+    if (m_softJpegThread.joinable())   m_softJpegThread.join();
 
     teardown();
 }
@@ -337,8 +415,8 @@ void RkmpiCapture::teardown()
     RK_MPI_SYS_UnBind(&srcChn, &dstChn);
 
     // ── VPSS teardown ─────────────────────────────────────────────────────────
-    RK_MPI_VPSS_DisableChn(VPSS_GRP_ID, VPSS_CHN_FULL);
-    RK_MPI_VPSS_DisableChn(VPSS_GRP_ID, VPSS_CHN_STR);
+    if (!m_cfg.enableVenc) RK_MPI_VPSS_DisableChn(VPSS_GRP_ID, VPSS_CHN_FULL);
+    RK_MPI_VPSS_DisableChn(VPSS_GRP_ID, VPSS_CHN_STR);  // always enabled
     RK_MPI_VPSS_DisableChn(VPSS_GRP_ID, VPSS_CHN_INF);
     RK_MPI_VPSS_StopGrp(VPSS_GRP_ID);
     RK_MPI_VPSS_DestroyGrp(VPSS_GRP_ID);
@@ -383,8 +461,12 @@ void RkmpiCapture::fetchLoop()
 
         // Pull the full-res frame for crops with a short timeout.
         // (chn1 stream is bound to VENC — not fetched here.)
-        ret = RK_MPI_VPSS_GetChnFrame(VPSS_GRP_ID, VPSS_CHN_FULL, &fullFrame, 200);
-        bool hasFull = (ret == RK_SUCCESS);
+        // CHN_FULL is only enabled when VENC is disabled (CMA pressure reduction).
+        bool hasFull = false;
+        if (!m_cfg.enableVenc) {
+            ret = RK_MPI_VPSS_GetChnFrame(VPSS_GRP_ID, VPSS_CHN_FULL, &fullFrame, 200);
+            hasFull = (ret == RK_SUCCESS);
+        }
 
         // Map virtual addresses and copy NV12 data out.
         RawFrame raw;
@@ -484,6 +566,61 @@ void RkmpiCapture::dispatchLoop()
 
         if (m_frameCb) m_frameCb(frame);
         ++m_frameCount;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  vencLoop — drain MJPEG stream from VENC and fire JpegCallback
+// ─────────────────────────────────────────────────────────────────────────────
+//  softwareJpegLoop — software JPEG encoding via stb_image_write
+//
+//  Used when enableVenc=false (hardware VENC bypassed due to mpp_vcodec driver
+//  incompatibility on this BSP).  Polls VPSS CHN_STR (640×480 NV12, depth=1),
+//  converts NV12→RGB, encodes to JPEG in memory via stbi_write_jpg_to_func,
+//  and fires JpegCallback with the result.
+//
+//  Throttled to ~15 fps — inference runs at ~20 fps on CHN_INF in parallel.
+//  CPU cost: ~5 ms per frame for NV12→RGB + JPEG encode at 640×480 q=75.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void stbJpegCallback(void* ctx, void* data, int size)
+{
+    auto* vec = static_cast<std::vector<uint8_t>*>(ctx);
+    const uint8_t* d = static_cast<const uint8_t*>(data);
+    vec->insert(vec->end(), d, d + size);
+}
+
+void RkmpiCapture::softwareJpegLoop()
+{
+    const int W  = m_cfg.streamWidth;
+    const int H  = m_cfg.streamHeight;
+    const size_t nv12Size = static_cast<size_t>(W * H * 3 / 2);
+    std::vector<uint8_t> nv12(nv12Size);
+    std::vector<uint8_t> rgb(static_cast<size_t>(W * H * 3));
+    std::vector<uint8_t> jpeg;
+    jpeg.reserve(64 * 1024);
+
+    while (!m_shouldStop.load()) {
+        VIDEO_FRAME_INFO_S frame{};
+        // Short timeout — returns quickly if no frame; loop handles shouldStop.
+        RK_S32 ret = RK_MPI_VPSS_GetChnFrame(VPSS_GRP_ID, VPSS_CHN_STR, &frame, 100);
+        if (ret != RK_SUCCESS) continue;
+
+        // Copy NV12 out immediately — release the VPSS buffer before encoding.
+        // JPEG encode takes ~5 ms; holding the buffer that long stalls VPSS.
+        void* virt = RK_MPI_MB_Handle2VirAddr(frame.stVFrame.pMbBlk);
+        if (virt) memcpy(nv12.data(), virt, nv12Size);
+        RK_MPI_VPSS_ReleaseChnFrame(VPSS_GRP_ID, VPSS_CHN_STR, &frame);
+
+        if (!virt) continue;
+
+        // NV12 → RGB → JPEG (CPU, no hardware DMA held)
+        nv12_to_rgb_u8(nv12.data(), W, H, rgb.data());
+        jpeg.clear();
+        stbi_write_jpg_to_func(stbJpegCallback, &jpeg, W, H, 3,
+                               rgb.data(), m_cfg.jpegQuality);
+        if (!jpeg.empty() && m_jpegCb)
+            m_jpegCb(jpeg.data(), jpeg.size());
     }
 }
 
