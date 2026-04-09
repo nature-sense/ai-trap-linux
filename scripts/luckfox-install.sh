@@ -16,18 +16,18 @@
 #
 #  Package source (in order of preference, unless overridden)
 #  ─────────────────────────────────────────────────────────
-#    1. Local build   build-luckfox/yolo_v4l2 exists (from build-luckfox-mac.sh)
+#    1. Local build   build-luckfox/yolo_rkmpi exists (from build-luckfox-mac.sh)
 #    2. GitHub Release  latest ai-trap-luckfox-*.tar.gz from GitHub Releases
 #
 #  What gets installed on the device
 #  ──────────────────────────────────
-#    /opt/trap/yolo_v4l2          application binary (RKNN NPU build)
+#    /opt/trap/yolo_rkmpi         application binary (RKMPI+VPSS+RKNN build)
 #    /opt/trap/model.rknn         RKNN INT8 model
-#    /opt/trap/librknnmrt.so       Rockchip NPU runtime
+#    /opt/trap/librknnmrt.so      Rockchip NPU runtime
 #    /opt/trap/trap_config.toml   production configuration
 #    /opt/trap/crops/             crop output directory
 #    /etc/init.d/S50wifi          WiFi AP/station manager
-#    /etc/init.d/S99trap          ai-trap service
+#    /etc/init.d/S99trap          ai-trap service (stops rkipc, uses RKMPI pipeline)
 #    /oem/usr/ko/rknpu.ko         Rockchip NPU kernel module (if --rknpu-only or --with-rknpu)
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -73,7 +73,7 @@ ensure_adb() {
 # ── Package detection ─────────────────────────────────────────────────────────
 
 find_local_package() {
-    [[ -f "${REPO_ROOT}/build-luckfox/yolo_v4l2" ]] && \
+    [[ -f "${REPO_ROOT}/build-luckfox/yolo_rkmpi" ]] && \
     [[ -f "${REPO_ROOT}/firmware/models/yolo11n-320/model.rknn" ]]
 }
 
@@ -166,9 +166,9 @@ push_files() {
     info "  ${INSTALL_DIR}/ ✓"
 
     step "Pushing binary"
-    adb push "${binary}" "${INSTALL_DIR}/yolo_v4l2"
-    adb shell "chmod 755 ${INSTALL_DIR}/yolo_v4l2"
-    info "  yolo_v4l2 ✓"
+    adb push "${binary}" "${INSTALL_DIR}/yolo_rkmpi"
+    adb shell "chmod 755 ${INSTALL_DIR}/yolo_rkmpi"
+    info "  yolo_rkmpi ✓"
 
     step "Pushing RKNN model"
     adb push "${rknn_model}" "${INSTALL_DIR}/model.rknn"
@@ -189,33 +189,30 @@ push_files() {
     tmp_s99trap="$(mktemp /tmp/S99trap.XXXXXX)"
     cat > "${tmp_s99trap}" << 'INITEOF'
 #!/bin/sh
-# /etc/init.d/S99trap — ai-trap RKNN NPU build
+# /etc/init.d/S99trap — ai-trap RKMPI+VPSS+RKNN build
 #
 # Design notes
 # ────────────
-# S21appinit (RkLunch.sh) starts rkipc at boot, which configures the ISP and
-# starts the full camera pipeline.  yolo_v4l2 opens /dev/video11 alongside
-# rkipc — the rkisp driver supports multiple readers on the main-path output.
-# Do NOT stop rkipc: tearing down the ISP pipeline leaves /dev/video11 with
-# no frames and causes V4L2Capture to block forever.
+# RKMPI (rockit) requires exclusive access to the ISP — it calls VI_EnableChn
+# which triggers ispStreamOn internally.  rkipc (started by S21appinit /
+# RkLunch.sh at boot) holds the VI device open and will conflict.  We stop
+# rkipc before starting yolo_rkmpi, and restart it on stop.
 #
-# rkaiq_3A_server is NOT started: running rkaiq causes rk_aiq_uapi_sysctl_start
-# to reconfigure the ISP hardware in a way that blocks NPU AXI DMA on RV1106
-# (NPU interrupt never fires, all inferences time out).  The rkipc-provided ISP
-# configuration is used instead — image has a slight green tint without AWB/CCM,
-# but detections work correctly.
+# Do NOT start rkaiq_3A_server.  The ISP runs with the static kernel DTB
+# config (slight green tint without AWB/CCM, but detections work correctly).
+# rkaiq reconfigures ISP hardware in a way that blocks NPU AXI DMA on RV1106.
 #
 # bypass_irq_handler=1: switches the NPU from interrupt-driven to polling mode.
-# On RV1106, the ISP DMA interrupt can starve the NPU completion interrupt (IRQ 37)
-# at a specific model layer (Conv:/model.8, task 85), causing a 6-second rknn_run
+# On RV1106, the ISP DMA interrupt can starve the NPU completion interrupt
+# (IRQ 37) at Conv:/model.8 (task 85 of 113), causing a 6-second rknn_run
 # timeout.  Polling bypasses the interrupt path entirely, eliminating the stall.
 
 INSTALL_DIR=/opt/trap
-BINARY=$INSTALL_DIR/yolo_v4l2
+BINARY=$INSTALL_DIR/yolo_rkmpi
 LOGFILE=/var/log/ai-trap.log
 PIDFILE=/var/run/ai-trap.pid
 
-# RKNN runtime is in /opt/trap — add to dynamic linker search path
+# RKNN runtime + librockit are in /opt/trap
 export LD_LIBRARY_PATH=/opt/trap${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 case "$1" in
@@ -224,7 +221,10 @@ case "$1" in
         echo "ai-trap is already running (PID=$(cat $PIDFILE))"
         exit 0
     fi
-    echo "Starting ai-trap (RKNN NPU)..."
+    echo "Starting ai-trap (RKMPI+RKNN)..."
+    # Stop rkipc — RKMPI needs exclusive ISP/VI access.
+    /etc/init.d/S21appinit stop 2>/dev/null || true
+    sleep 1
     # Reload the NPU driver to recover from any prior SIGKILL that arrived
     # during rknn_run — SIGKILL during inference corrupts rknpu driver state
     # and causes rknn_init to fail on the next launch.  rmmod/insmod is fast
@@ -239,30 +239,33 @@ case "$1" in
         "$INSTALL_DIR/model.rknn" \
         "$INSTALL_DIR/detections.db" \
         "$INSTALL_DIR/crops" \
-        /dev/video11 \
         >> "$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     echo "ai-trap started (PID=$!)"
     ;;
   stop)
     echo "Stopping ai-trap..."
-    # Kill ALL yolo_v4l2 instances (pidfile may be stale if a previous stop
+    # Kill ALL yolo_rkmpi instances (pidfile may be stale if a previous stop
     # failed to wait for the process to exit).
-    killall yolo_v4l2 2>/dev/null || true
+    killall yolo_rkmpi 2>/dev/null || true
     rm -f "$PIDFILE"
     # Wait up to 10 s for SIGTERM to be honoured (process may be inside a
     # 6-second rknn_run timeout and can't handle signals until it returns).
     for i in 1 2 3 4 5 6 7 8 9 10; do
         sleep 1
-        pgrep -x yolo_v4l2 > /dev/null 2>&1 || { echo "ai-trap stopped."; exit 0; }
+        pgrep -x yolo_rkmpi > /dev/null 2>&1 || { echo "ai-trap stopped."; break; }
         echo "  waiting for process to exit... (${i}s)"
     done
     # Still alive after 10 s — force-kill.  Driver state will be recovered by
     # rmmod/insmod at the start of the next S99trap start invocation.
-    echo "  process did not exit gracefully — sending SIGKILL"
-    killall -9 yolo_v4l2 2>/dev/null || true
-    sleep 1
-    echo "ai-trap killed."
+    if pgrep -x yolo_rkmpi > /dev/null 2>&1; then
+        echo "  process did not exit gracefully — sending SIGKILL"
+        killall -9 yolo_rkmpi 2>/dev/null || true
+        sleep 1
+        echo "ai-trap killed."
+    fi
+    # Restart rkipc so the board is usable without ai-trap running.
+    /etc/init.d/S21appinit start 2>/dev/null || true
     ;;
   restart)
     "$0" stop; sleep 1; "$0" start
@@ -369,7 +372,7 @@ if [[ "${MODE}" == "--local" ]] || \
 
     info "Using local build from build-luckfox/"
 
-    if [[ ! -f "${REPO_ROOT}/build-luckfox/yolo_v4l2" ]]; then
+    if [[ ! -f "${REPO_ROOT}/build-luckfox/yolo_rkmpi" ]]; then
         error "Binary not found. Build first: bash scripts/build-luckfox-mac.sh"
     fi
     if [[ ! -f "${REPO_ROOT}/firmware/models/yolo11n-320/model.rknn" ]]; then
@@ -384,7 +387,7 @@ if [[ "${MODE}" == "--local" ]] || \
        Run: bash scripts/build-luckfox-mac.sh  (it fetches librknnrt automatically)"
 
     push_files \
-        "${REPO_ROOT}/build-luckfox/yolo_v4l2" \
+        "${REPO_ROOT}/build-luckfox/yolo_rkmpi" \
         "${REPO_ROOT}/firmware/models/yolo11n-320/model.rknn" \
         "${LIBRKNNRT}" \
         "${REPO_ROOT}/package/luckfox/trap_config.toml" \
@@ -400,7 +403,7 @@ elif [[ "${MODE}" == "--release" ]] || [[ "${MODE}" == "auto" ]]; then
         error "librknnmrt.so not found in release package. Use --local instead."
 
     push_files \
-        "${PKG_DIR}/yolo_v4l2" \
+        "${PKG_DIR}/yolo_rkmpi" \
         "${PKG_DIR}/model.rknn" \
         "${PKG_DIR}/librknnmrt.so" \
         "${PKG_DIR}/trap_config.toml" \
