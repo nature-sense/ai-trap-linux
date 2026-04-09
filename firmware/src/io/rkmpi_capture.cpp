@@ -2,7 +2,16 @@
 #include "imgproc.h"
 #include "float_mat.h"
 
-#include "stb_image_write.h"
+// JPEG encoding: prefer libjpeg-turbo (NEON SIMD, ~5ms per frame on Cortex-A7)
+// over stb_image_write (~100ms, no SIMD).  libjpeg-turbo is cross-compiled by
+// build-luckfox-mac.sh and linked statically — no runtime dependency.
+// Fall back to stb if libjpeg is not available (e.g. native/Pi builds).
+#if defined(HAVE_LIBJPEG)
+#  include <jpeglib.h>
+#  include <csetjmp>
+#else
+#  include "stb_image_write.h"
+#endif
 
 // RKMPI headers (from Luckfox SDK: media/rockit/rockit/mpi/sdk/include/)
 #include <rk_mpi_mb.h>
@@ -231,13 +240,15 @@ void RkmpiCapture::initVPSS()
     check(RK_MPI_VPSS_EnableChn(VPSS_GRP_ID, VPSS_CHN_INF), "VPSS_EnableChn(inf)");
 
     // ── Channel 1 — stream (640×480) ──
-    // enableVenc=true  → depth=0, bound to VENC (hardware MJPEG)
-    // enableVenc=false → depth=1, polled by softwareJpegLoop for software JPEG
+    // enableVenc=true  → depth=0, NV12, bound to VENC (hardware MJPEG)
+    // enableVenc=false → depth=1, NV12, polled by softwareJpegLoop.
+    //   NV12→RGB is done in CPU (nv12_to_rgb_u8) before JPEG encoding.
+    //   Note: RK_FMT_RGB888 is not reliably supported by VPSS on this BSP.
     {
         VPSS_CHN_ATTR_S strAttr{};
         strAttr.enChnMode       = VPSS_CHN_MODE_USER;
         strAttr.enDynamicRange  = DYNAMIC_RANGE_SDR8;
-        strAttr.enPixelFormat   = RK_FMT_YUV420SP;
+        strAttr.enPixelFormat   = RK_FMT_YUV420SP;   // NV12 — safe on all BSPs
         strAttr.enCompressMode  = COMPRESS_MODE_NONE;
         strAttr.u32Width        = static_cast<RK_U32>(m_cfg.streamWidth);
         strAttr.u32Height       = static_cast<RK_U32>(m_cfg.streamHeight);
@@ -570,18 +581,85 @@ void RkmpiCapture::dispatchLoop()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  vencLoop — drain MJPEG stream from VENC and fire JpegCallback
-// ─────────────────────────────────────────────────────────────────────────────
-//  softwareJpegLoop — software JPEG encoding via stb_image_write
+//  softwareJpegLoop — JPEG encoding of the MJPEG stream
 //
 //  Used when enableVenc=false (hardware VENC bypassed due to mpp_vcodec driver
 //  incompatibility on this BSP).  Polls VPSS CHN_STR (640×480 NV12, depth=1),
-//  converts NV12→RGB, encodes to JPEG in memory via stbi_write_jpg_to_func,
-//  and fires JpegCallback with the result.
+//  converts NV12→RGB in CPU, then encodes to JPEG.
 //
-//  Throttled to ~15 fps — inference runs at ~20 fps on CHN_INF in parallel.
-//  CPU cost: ~5 ms per frame for NV12→RGB + JPEG encode at 640×480 q=75.
+//  Note: RK_FMT_RGB888 output from VPSS was attempted but causes the process
+//  to enter D-state on this BSP — RGA2 on RV1106 does not reliably support
+//  RGB888 as a VPSS channel output format.  NV12 is used instead.
+//
+//  Encoding backend (selected at compile time):
+//    HAVE_LIBJPEG: libjpeg-turbo with NEON SIMD — ~5–10 ms per 640×480 frame.
+//    fallback:     stb_image_write — ~100 ms, no SIMD (6fps ceiling).
 // ─────────────────────────────────────────────────────────────────────────────
+
+#if defined(HAVE_LIBJPEG)
+
+// libjpeg-turbo error handler — longjmp on fatal error so we don't abort().
+struct JpegErrorMgr {
+    jpeg_error_mgr pub;
+    jmp_buf        jmpBuf;
+};
+
+static void jpegErrorExit(j_common_ptr cinfo)
+{
+    auto* mgr = reinterpret_cast<JpegErrorMgr*>(cinfo->err);
+    longjmp(mgr->jmpBuf, 1);
+}
+
+// Encode packed RGB888 → JPEG using libjpeg-turbo.
+// Returns an empty vector on failure.
+static std::vector<uint8_t> encodeJpegTurbo(
+    const uint8_t* rgb, int W, int H, int quality)
+{
+    jpeg_compress_struct cinfo{};
+    JpegErrorMgr         jerr{};
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpegErrorExit;
+
+    std::vector<uint8_t> out;
+
+    if (setjmp(jerr.jmpBuf)) {
+        jpeg_destroy_compress(&cinfo);
+        return {};
+    }
+
+    jpeg_create_compress(&cinfo);
+
+    // In-memory destination: libjpeg-turbo allocates the buffer; we copy it.
+    unsigned char* jpegBuf = nullptr;
+    unsigned long  jpegLen = 0;
+    jpeg_mem_dest(&cinfo, &jpegBuf, &jpegLen);
+
+    cinfo.image_width      = static_cast<JDIMENSION>(W);
+    cinfo.image_height     = static_cast<JDIMENSION>(H);
+    cinfo.input_components = 3;
+    cinfo.in_color_space   = JCS_RGB;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+
+    jpeg_start_compress(&cinfo, TRUE);
+    while (cinfo.next_scanline < cinfo.image_height) {
+        // Cast away const — libjpeg API requires JSAMPROW (non-const).
+        JSAMPROW row = const_cast<JSAMPROW>(
+            rgb + static_cast<size_t>(cinfo.next_scanline) * W * 3);
+        jpeg_write_scanlines(&cinfo, &row, 1);
+    }
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+
+    if (jpegBuf && jpegLen > 0) {
+        out.assign(jpegBuf, jpegBuf + jpegLen);
+        free(jpegBuf);  // libjpeg-turbo allocates with malloc
+    }
+    return out;
+}
+
+#else  // stb fallback
 
 static void stbJpegCallback(void* ctx, void* data, int size)
 {
@@ -590,35 +668,48 @@ static void stbJpegCallback(void* ctx, void* data, int size)
     vec->insert(vec->end(), d, d + size);
 }
 
+#endif  // HAVE_LIBJPEG
+
 void RkmpiCapture::softwareJpegLoop()
 {
-    const int W  = m_cfg.streamWidth;
-    const int H  = m_cfg.streamHeight;
+    const int W = m_cfg.streamWidth;
+    const int H = m_cfg.streamHeight;
+    // VPSS CHN_STR outputs NV12. CPU converts to RGB before JPEG encoding.
     const size_t nv12Size = static_cast<size_t>(W * H * 3 / 2);
+    const size_t rgbSize  = static_cast<size_t>(W * H * 3);
     std::vector<uint8_t> nv12(nv12Size);
-    std::vector<uint8_t> rgb(static_cast<size_t>(W * H * 3));
+    std::vector<uint8_t> rgb(rgbSize);
     std::vector<uint8_t> jpeg;
     jpeg.reserve(64 * 1024);
 
+#if defined(HAVE_LIBJPEG)
+    fprintf(stderr, "[rkmpi] softwareJpegLoop: libjpeg-turbo NEON encoder\n");
+#else
+    fprintf(stderr, "[rkmpi] softwareJpegLoop: stb_image_write fallback encoder\n");
+#endif
+
     while (!m_shouldStop.load()) {
         VIDEO_FRAME_INFO_S frame{};
-        // Short timeout — returns quickly if no frame; loop handles shouldStop.
         RK_S32 ret = RK_MPI_VPSS_GetChnFrame(VPSS_GRP_ID, VPSS_CHN_STR, &frame, 100);
         if (ret != RK_SUCCESS) continue;
 
-        // Copy NV12 out immediately — release the VPSS buffer before encoding.
-        // JPEG encode takes ~5 ms; holding the buffer that long stalls VPSS.
+        // Copy NV12 out immediately and release the VPSS buffer before encoding.
         void* virt = RK_MPI_MB_Handle2VirAddr(frame.stVFrame.pMbBlk);
         if (virt) memcpy(nv12.data(), virt, nv12Size);
         RK_MPI_VPSS_ReleaseChnFrame(VPSS_GRP_ID, VPSS_CHN_STR, &frame);
 
         if (!virt) continue;
 
-        // NV12 → RGB → JPEG (CPU, no hardware DMA held)
+        // NV12 → RGB (CPU) → JPEG (libjpeg-turbo NEON or stb fallback)
         nv12_to_rgb_u8(nv12.data(), W, H, rgb.data());
+
+#if defined(HAVE_LIBJPEG)
+        jpeg = encodeJpegTurbo(rgb.data(), W, H, m_cfg.jpegQuality);
+#else
         jpeg.clear();
         stbi_write_jpg_to_func(stbJpegCallback, &jpeg, W, H, 3,
                                rgb.data(), m_cfg.jpegQuality);
+#endif
         if (!jpeg.empty() && m_jpegCb)
             m_jpegCb(jpeg.data(), jpeg.size());
     }

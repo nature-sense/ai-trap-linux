@@ -212,8 +212,9 @@ BINARY=$INSTALL_DIR/yolo_rkmpi
 LOGFILE=/var/log/ai-trap.log
 PIDFILE=/var/run/ai-trap.pid
 
-# RKNN runtime + librockit are in /opt/trap
-export LD_LIBRARY_PATH=/opt/trap${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+# RKNN runtime (librknnmrt.so) is in /opt/trap.
+# librockit.so is in /oem/usr/lib — add both to the search path.
+export LD_LIBRARY_PATH=/opt/trap:/oem/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 case "$1" in
   start)

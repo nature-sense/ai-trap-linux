@@ -155,6 +155,11 @@ if _cross_sysroot != ''
     # librockit.so + headers fetched from LuckfoxTECH/luckfox-pico SDK by
     # build-luckfox-mac.sh.  Already present on the device at /usr/lib/librockit.so.
     rockit_dep = cxx.find_library('rockit', dirs : [_lib], required : false)
+
+    # libjpeg-turbo static — NEON-accelerated JPEG encoding for the MJPEG stream.
+    # Built by build-luckfox-mac.sh and installed as a static lib into the sysroot.
+    # Static link means no runtime dependency — binary is self-contained.
+    jpeg_dep = cxx.find_library('jpeg', dirs : [_lib], required : false, static : true)
   endif
 else
   sqlite3_dep = dependency('sqlite3', required : true)
@@ -262,8 +267,10 @@ if target_opt == 'rkmpi' or target_opt == 'all'
         'firmware/main_rkmpi.cpp',
       ),
       include_directories : inc,
-      dependencies        : shared_deps + [rknn_dep, rockit_dep],
-      cpp_args            : ['-DWIFI_BACKEND_HOSTAPD'],
+      dependencies        : shared_deps + [rknn_dep, rockit_dep] +
+                            (jpeg_dep.found() ? [jpeg_dep] : []),
+      cpp_args            : ['-DWIFI_BACKEND_HOSTAPD'] +
+                            (jpeg_dep.found() ? ['-DHAVE_LIBJPEG'] : []),
     )
   endif
 endif

@@ -152,6 +152,53 @@ else
     banner "SQLite3 cached — skipping build"
 fi
 
+# ── libjpeg-turbo ─────────────────────────────────────────────────────────────
+#
+# Used by softwareJpegLoop in rkmpi_capture.cpp for fast NEON-accelerated JPEG
+# encoding of the 640×480 MJPEG stream.  Replaces stb_image_write which has no
+# SIMD and costs ~100 ms per frame on the Cortex-A7.
+#
+# Built as a static library (libjpeg.a + libturbojpeg.a) so there is no runtime
+# dependency — the binary is fully self-contained.
+#
+# libjpeg-turbo uses CMake.  We invoke it with the cross toolchain via
+# CMAKE_TOOLCHAIN_FILE-equivalent flags and install into the sysroot.
+
+LIBJPEG_TURBO_VERSION="3.1.0"
+
+if [[ ! -f "${SYSROOT}/usr/lib/libjpeg.a" ]]; then
+    banner "Cross-compiling libjpeg-turbo ${LIBJPEG_TURBO_VERSION}"
+    mkdir -p /tmp/jpeg-build
+    curl -fsSL \
+        "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${LIBJPEG_TURBO_VERSION}/libjpeg-turbo-${LIBJPEG_TURBO_VERSION}.tar.gz" \
+        | tar xz -C /tmp/jpeg-build
+    mkdir -p /tmp/jpeg-build/build
+    cmake \
+        -S "/tmp/jpeg-build/libjpeg-turbo-${LIBJPEG_TURBO_VERSION}" \
+        -B /tmp/jpeg-build/build \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_SYSTEM_NAME=Linux \
+        -DCMAKE_SYSTEM_PROCESSOR=arm \
+        -DCMAKE_C_COMPILER="${TOOLCHAIN_DIR}/bin/${CROSS}-gcc" \
+        -DCMAKE_CXX_COMPILER="${TOOLCHAIN_DIR}/bin/${CROSS}-g++" \
+        -DCMAKE_AR="${TOOLCHAIN_DIR}/bin/${CROSS}-ar" \
+        -DCMAKE_RANLIB="${TOOLCHAIN_DIR}/bin/${CROSS}-ranlib" \
+        -DCMAKE_C_FLAGS="${ARM_FLAGS}" \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DENABLE_SHARED=OFF \
+        -DENABLE_STATIC=ON \
+        -DWITH_JPEG8=1 \
+        -DWITH_SIMD=ON \
+        -DREQUIRE_SIMD=OFF
+    ninja -C /tmp/jpeg-build/build -j"${JOBS}"
+    DESTDIR="${SYSROOT}" ninja -C /tmp/jpeg-build/build install
+    rm -rf /tmp/jpeg-build
+    echo "libjpeg-turbo → ${SYSROOT}/usr/lib/libjpeg.a"
+else
+    banner "libjpeg-turbo cached — skipping build"
+fi
+
 # ── RKNN runtime (librknnmrt.so + rknn_api.h) ────────────────────────────────
 #
 # RV1106 uses the RKNN *mini* runtime (librknnmrt.so), not the full librknnrt.so
