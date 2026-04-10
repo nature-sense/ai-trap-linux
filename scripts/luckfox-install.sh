@@ -198,16 +198,20 @@ push_files() {
 # RkLunch.sh at boot) holds the VI device open and will conflict.  We stop
 # rkipc before starting yolo_rkmpi, and restart it on stop.
 #
-# rkaiq ISP engine: yolo_rkmpi initialises librkaiq.so in-process (before
-# RK_MPI_SYS_Init) following the official rv1106_aiisp_ipc SDK order:
-#   NPU DMA alloc → rkaiq init/prepare/start → RKMPI SYS_Init → VI_EnableChn.
-# This ordering prevents AXI bus contention.  Do NOT start rkaiq_3A_server —
-# that is a separate standalone daemon and conflicts with in-process rkaiq.
+# rkaiq ISP engine (--no-rkaiq flag): rkaiq in-process (librkaiq.so) has been
+# disabled because it causes the ISP to claim full AXI bus ownership, starving
+# the NPU DMA completely (irq status 0x0 after 6.5 s; all inference times out).
+# Root cause: RV1106 ISP has hard-coded highest NOC bus priority; no QoS
+# configuration is exposed in sysfs.  The same librkaiq.so is on /oem/usr/lib
+# (OEM version = GitHub version, same git hash 25bd14e), ruling out version
+# mismatch.  Software WB correction (4.57 R / 1.77 G / 2.95 B) is applied
+# instead.  Remove --no-rkaiq to re-enable rkaiq if a bus QoS fix is found.
 #
 # bypass_irq_handler=1: switches the NPU from interrupt-driven to polling mode.
 # On RV1106, the ISP DMA interrupt can starve the NPU completion interrupt
 # (IRQ 37) at Conv:/model.8 (task 85 of 113), causing a 6-second rknn_run
-# timeout.  Polling bypasses the interrupt path entirely, eliminating the stall.
+# timeout.  Polling bypasses the interrupt path entirely.  Still needed even
+# without rkaiq for robustness against any ISP/CIF DMA interference.
 
 INSTALL_DIR=/opt/trap
 BINARY=$INSTALL_DIR/yolo_rkmpi
@@ -238,7 +242,7 @@ case "$1" in
     # completion interrupt (IRQ 37) at Conv:/model.8 (task 85 of 113).
     echo 1 > /sys/module/rknpu/parameters/bypass_irq_handler
     cd "$INSTALL_DIR"
-    "$BINARY" \
+    "$BINARY" --no-rkaiq \
         "$INSTALL_DIR/model.rknn" \
         "$INSTALL_DIR/detections.db" \
         "$INSTALL_DIR/crops" \
