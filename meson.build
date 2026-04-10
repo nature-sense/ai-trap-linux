@@ -160,6 +160,13 @@ if _cross_sysroot != ''
     # Built by build-luckfox-mac.sh and installed as a static lib into the sysroot.
     # Static link means no runtime dependency — binary is self-contained.
     jpeg_dep = cxx.find_library('jpeg', dirs : [_lib], required : false, static : true)
+
+    # rkaiq ISP engine — AE/AWB/AF/CCM running inside the ISP hardware.
+    # librkaiq.so + headers fetched from LuckfoxTECH/luckfox-pico SDK by
+    # build-luckfox-mac.sh.  Already present on the device at /oem/usr/lib/.
+    # Optional: yolo_rkmpi builds and runs without it (falls back to software WB),
+    # but image quality is significantly better with rkaiq providing proper AWB/CCM.
+    rkaiq_dep = cxx.find_library('rkaiq', dirs : [_lib], required : false)
   endif
 else
   sqlite3_dep = dependency('sqlite3', required : true)
@@ -268,9 +275,11 @@ if target_opt == 'rkmpi' or target_opt == 'all'
       ),
       include_directories : inc,
       dependencies        : shared_deps + [rknn_dep, rockit_dep] +
-                            (jpeg_dep.found() ? [jpeg_dep] : []),
+                            (jpeg_dep.found()  ? [jpeg_dep]  : []) +
+                            (rkaiq_dep.found() ? [rkaiq_dep] : []),
       cpp_args            : ['-DWIFI_BACKEND_HOSTAPD'] +
-                            (jpeg_dep.found() ? ['-DHAVE_LIBJPEG'] : []),
+                            (jpeg_dep.found()  ? ['-DHAVE_LIBJPEG'] : []) +
+                            (rkaiq_dep.found() ? ['-DHAVE_RKAIQ']   : []),
     )
   endif
 endif

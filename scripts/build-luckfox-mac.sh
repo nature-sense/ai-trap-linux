@@ -288,6 +288,54 @@ else
     banner "RKMPI headers + librockit.so cached — skipping fetch"
 fi
 
+# ── rkaiq ISP engine (librkaiq.so + headers) ─────────────────────────────────
+#
+# rkaiq is the Rockchip AE/AWB/AF/CCM ISP engine for RV1106.  It runs
+# in-process (linked as librkaiq.so), initialised BEFORE RK_MPI_SYS_Init().
+# With rkaiq active, the ISP hardware applies white-balance, exposure and
+# colour-correction automatically — no software WB correction needed.
+#
+# Fetched from the Luckfox SDK release directory:
+#   media/isp/release_camera_engine_rkaiq_rv1106_arm-rockchip830-linux-uclibcgnueabihf/
+#
+# librkaiq.so is already present on the device at /oem/usr/lib/.  We only
+# need it in the sysroot for linking; LD_LIBRARY_PATH in S99trap supplies
+# /oem/usr/lib at runtime so the binary finds it without an explicit RPATH.
+
+RKAIQ_SDK_PATH="media/isp/release_camera_engine_rkaiq_rv1106_arm-rockchip830-linux-uclibcgnueabihf"
+RKAIQ_MARKER="${SYSROOT}/usr/include/rkaiq/uAPI2/rk_aiq_user_api2_sysctl.h"
+
+if [[ ! -f "${RKAIQ_MARKER}" ]]; then
+    banner "Fetching rkaiq headers + librkaiq.so from Luckfox SDK"
+    mkdir -p "${SYSROOT}/usr/include/rkaiq" "${SYSROOT}/usr/lib"
+
+    git clone --depth 1 --filter=blob:none --sparse \
+        https://github.com/LuckfoxTECH/luckfox-pico.git /tmp/luckfox-sdk-rkaiq
+    cd /tmp/luckfox-sdk-rkaiq
+    git sparse-checkout set \
+        "${RKAIQ_SDK_PATH}/include" \
+        "${RKAIQ_SDK_PATH}/lib"
+
+    if [[ -d "${RKAIQ_SDK_PATH}/include/rkaiq" ]]; then
+        cp -r "${RKAIQ_SDK_PATH}/include/rkaiq/." "${SYSROOT}/usr/include/rkaiq/"
+        echo "rkaiq headers → ${SYSROOT}/usr/include/rkaiq/"
+    else
+        echo "WARNING: rkaiq headers not found in Luckfox SDK — build continues without ISP engine" >&2
+    fi
+
+    if [[ -f "${RKAIQ_SDK_PATH}/lib/librkaiq.so" ]]; then
+        cp -v "${RKAIQ_SDK_PATH}/lib/librkaiq.so" "${SYSROOT}/usr/lib/"
+        echo "librkaiq.so → ${SYSROOT}/usr/lib/"
+    else
+        echo "WARNING: librkaiq.so not found in Luckfox SDK — build continues without ISP engine" >&2
+    fi
+
+    cd /
+    rm -rf /tmp/luckfox-sdk-rkaiq
+else
+    banner "rkaiq headers + librkaiq.so cached — skipping fetch"
+fi
+
 # ── Meson cross file ─────────────────────────────────────────────────────────
 
 banner "Generating meson cross file"
@@ -314,8 +362,8 @@ pkg_config_libdir = '${SYSROOT}/usr/lib/pkgconfig:${SYSROOT}/usr/share/pkgconfig
 cmake_prefix_path = ['${SYSROOT}/usr']
 
 [built-in options]
-cpp_args = ['-isystem', '${SYSROOT}/usr/include', '-isystem', '${SYSROOT}/usr/include/rkmpi']
-c_args   = ['-isystem', '${SYSROOT}/usr/include', '-isystem', '${SYSROOT}/usr/include/rkmpi']
+cpp_args = ['-isystem', '${SYSROOT}/usr/include', '-isystem', '${SYSROOT}/usr/include/rkmpi', '-isystem', '${SYSROOT}/usr/include/rkaiq']
+c_args   = ['-isystem', '${SYSROOT}/usr/include', '-isystem', '${SYSROOT}/usr/include/rkmpi', '-isystem', '${SYSROOT}/usr/include/rkaiq']
 EOF
 
 # ── Configure + build ─────────────────────────────────────────────────────────

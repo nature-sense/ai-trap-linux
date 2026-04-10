@@ -10,6 +10,14 @@
 #include "wifi_manager.h"
 #include "rknn_infer.h"
 
+// rkaiq ISP engine — AE/AWB/AF/CCM in ISP hardware.
+// Enabled when librkaiq.so is present in the cross-compile sysroot
+// (fetched by build-luckfox-mac.sh from the Luckfox SDK).
+// If unavailable, the build falls back to empirical software WB correction.
+#ifdef HAVE_RKAIQ
+#include "uAPI2/rk_aiq_user_api2_sysctl.h"
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -119,6 +127,12 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT,  onSignal);
     std::signal(SIGTERM, onSignal);
     std::signal(SIGPIPE, SIG_IGN);
+
+    // rkaiq context — initialised after RKNN is ready, before cam.open().
+    // Declared here so it is visible to both the init block and the shutdown block.
+#ifdef HAVE_RKAIQ
+    rk_aiq_sys_ctx_t* aiqCtx = nullptr;
+#endif
 
     // ── Shared inference queue ────────────────────────────────────────────────
     AsyncInferenceQueue inferQueue;
@@ -343,6 +357,78 @@ int main(int argc, char* argv[]) {
     }
     printf("RKNN NPU context ready — starting RKMPI capture\n\n");
 
+    // ── rkaiq ISP engine initialisation ──────────────────────────────────────
+    //
+    // rkaiq must be initialised AFTER the RKNN context (NPU DMA allocated above)
+    // and BEFORE cam.open() (which calls RK_MPI_SYS_Init() and VI_EnableChn).
+    // This ordering matches the official rv1106_aiisp_ipc SDK and ensures that
+    // NPU DMA and rkaiq ISP DMA do not collide on the RV1106 AXI bus.
+    //
+    // With rkaiq running:
+    //   • AWB, AE, CCM and gamma correction are performed inside the ISP hardware.
+    //   • The NV12 frames from VI are already properly white-balanced.
+    //   • Software WB correction (wbR/wbG/wbB in RkmpiConfig) is set to 1.0.
+    //
+    // On failure (IQ files missing, sensor probe fails, etc.) we fall back
+    // gracefully to the empirical software WB correction applied in softwareJpegLoop.
+#ifdef HAVE_RKAIQ
+    {
+        static const char* IQ_DIR       = "/oem/usr/share/iqfiles";
+        static const char* VI_VIDEO_DEV = "/dev/video0";
+
+        printf("Initialising rkaiq ISP engine (IQ dir: %s)...\n", IQ_DIR);
+
+        // Resolve the sensor entity name bound to the VI video device.
+        // rkaiq needs this to locate the correct IQ tuning file and configure
+        // the ISP pipeline for this specific sensor.
+        const char* snsEntName =
+            rk_aiq_uapi2_sysctl_getBindedSnsEntNmByVd(VI_VIDEO_DEV);
+
+        if (!snsEntName || snsEntName[0] == '\0') {
+            fprintf(stderr, "[rkaiq] cannot resolve sensor entity name for %s"
+                            " — falling back to software WB\n", VI_VIDEO_DEV);
+        } else {
+            printf("  sensor entity : %s\n", snsEntName);
+
+            aiqCtx = rk_aiq_uapi2_sysctl_init(snsEntName, IQ_DIR,
+                                               nullptr, nullptr);
+            if (!aiqCtx) {
+                fprintf(stderr, "[rkaiq] sysctl_init failed"
+                                " — falling back to software WB\n");
+            } else {
+                // Prepare for the configured capture resolution in normal
+                // (non-HDR) mode.  Must be called after init and before start.
+                XCamReturn ret = rk_aiq_uapi2_sysctl_prepare(
+                    aiqCtx,
+                    static_cast<uint32_t>(camCfg.captureWidth),
+                    static_cast<uint32_t>(camCfg.captureHeight),
+                    RK_AIQ_WORKING_MODE_NORMAL);
+
+                if (ret != XCAM_RETURN_NO_ERROR) {
+                    fprintf(stderr, "[rkaiq] sysctl_prepare failed (%d)"
+                                    " — falling back to software WB\n", ret);
+                    rk_aiq_uapi2_sysctl_deinit(aiqCtx);
+                    aiqCtx = nullptr;
+                } else {
+                    ret = rk_aiq_uapi2_sysctl_start(aiqCtx);
+                    if (ret != XCAM_RETURN_NO_ERROR) {
+                        fprintf(stderr, "[rkaiq] sysctl_start failed (%d)"
+                                        " — falling back to software WB\n", ret);
+                        rk_aiq_uapi2_sysctl_deinit(aiqCtx);
+                        aiqCtx = nullptr;
+                    } else {
+                        printf("  rkaiq started — AWB/AE/CCM active in ISP hardware\n");
+                        // ISP now handles white-balance in hardware: neutralise
+                        // the software WB gains so softwareJpegLoop is a no-op.
+                        camCfg.wbR = camCfg.wbG = camCfg.wbB = 1.0f;
+                        printf("  software WB correction disabled (ISP handles it)\n\n");
+                    }
+                }
+            }
+        }
+    }
+#endif  // HAVE_RKAIQ
+
     // ── RKMPI capture ─────────────────────────────────────────────────────────
     //
     // Opened AFTER RKNN context is fully initialised to avoid simultaneous
@@ -410,6 +496,16 @@ int main(int argc, char* argv[]) {
     cam.stop();
     inferQueue.stop();
     if (inferThread.joinable()) inferThread.join();
+
+    // Stop rkaiq after VI/RKMPI is closed (cam.stop() deactivates VI first).
+#ifdef HAVE_RKAIQ
+    if (aiqCtx) {
+        printf("Stopping rkaiq ISP engine...\n");
+        rk_aiq_uapi2_sysctl_stop(aiqCtx, /*keep_ext_hw_st=*/false);
+        rk_aiq_uapi2_sysctl_deinit(aiqCtx);
+        aiqCtx = nullptr;
+    }
+#endif
 
     http.close();
     sse.close();

@@ -198,9 +198,11 @@ push_files() {
 # RkLunch.sh at boot) holds the VI device open and will conflict.  We stop
 # rkipc before starting yolo_rkmpi, and restart it on stop.
 #
-# Do NOT start rkaiq_3A_server.  The ISP runs with the static kernel DTB
-# config (slight green tint without AWB/CCM, but detections work correctly).
-# rkaiq reconfigures ISP hardware in a way that blocks NPU AXI DMA on RV1106.
+# rkaiq ISP engine: yolo_rkmpi initialises librkaiq.so in-process (before
+# RK_MPI_SYS_Init) following the official rv1106_aiisp_ipc SDK order:
+#   NPU DMA alloc → rkaiq init/prepare/start → RKMPI SYS_Init → VI_EnableChn.
+# This ordering prevents AXI bus contention.  Do NOT start rkaiq_3A_server —
+# that is a separate standalone daemon and conflicts with in-process rkaiq.
 #
 # bypass_irq_handler=1: switches the NPU from interrupt-driven to polling mode.
 # On RV1106, the ISP DMA interrupt can starve the NPU completion interrupt
@@ -265,8 +267,10 @@ case "$1" in
         sleep 1
         echo "ai-trap killed."
     fi
-    # Restart rkipc so the board is usable without ai-trap running.
-    /etc/init.d/S21appinit start 2>/dev/null || true
+    # NOTE: do NOT restart rkipc here.  rkipc briefly opening and closing the
+    # VI/ISP device corrupts the VI driver state, causing 0xa006800e on the next
+    # yolo_rkmpi start (VPSS gets no frames).  This device is a dedicated trap —
+    # rkipc is not needed when yolo_rkmpi is stopped.
     ;;
   restart)
     "$0" stop; sleep 1; "$0" start
