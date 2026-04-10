@@ -14,8 +14,12 @@
 // Enabled when librkaiq.so is present in the cross-compile sysroot
 // (fetched by build-luckfox-mac.sh from the Luckfox SDK).
 // If unavailable, the build falls back to empirical software WB correction.
+//
+// We use a minimal forward-declaration header (rkaiq_minimal.h) rather than
+// the full rkaiq SDK headers, which have complex cross-directory dependencies
+// across uAPI2/, common/, algos/, xcore/ and dozens of sub-headers.
 #ifdef HAVE_RKAIQ
-#include "uAPI2/rk_aiq_user_api2_sysctl.h"
+#include "rkaiq_minimal.h"
 #endif
 
 #include <atomic>

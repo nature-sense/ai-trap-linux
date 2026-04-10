@@ -362,8 +362,8 @@ pkg_config_libdir = '${SYSROOT}/usr/lib/pkgconfig:${SYSROOT}/usr/share/pkgconfig
 cmake_prefix_path = ['${SYSROOT}/usr']
 
 [built-in options]
-cpp_args = ['-isystem', '${SYSROOT}/usr/include', '-isystem', '${SYSROOT}/usr/include/rkmpi', '-isystem', '${SYSROOT}/usr/include/rkaiq']
-c_args   = ['-isystem', '${SYSROOT}/usr/include', '-isystem', '${SYSROOT}/usr/include/rkmpi', '-isystem', '${SYSROOT}/usr/include/rkaiq']
+cpp_args = ['-isystem', '${SYSROOT}/usr/include', '-isystem', '${SYSROOT}/usr/include/rkmpi']
+c_args   = ['-isystem', '${SYSROOT}/usr/include', '-isystem', '${SYSROOT}/usr/include/rkmpi']
 EOF
 
 # ── Configure + build ─────────────────────────────────────────────────────────
