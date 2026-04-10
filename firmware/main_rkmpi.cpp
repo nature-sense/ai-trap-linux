@@ -249,7 +249,7 @@ int main(int argc, char* argv[]) {
     RkmpiConfig camCfg;
     camCfg.captureWidth  = 1920;
     camCfg.captureHeight = 1080;
-    camCfg.framerate     = 30;
+    camCfg.framerate     = 0;   // 0 = VPSS passthrough; set > 0 to throttle group
     camCfg.bufferCount   = 4;
     camCfg.modelWidth    = 320;
     camCfg.modelHeight   = 320;
@@ -378,7 +378,9 @@ int main(int argc, char* argv[]) {
 #ifdef HAVE_RKAIQ
     {
         static const char* IQ_DIR       = "/oem/usr/share/iqfiles";
-        static const char* VI_VIDEO_DEV = "/dev/video0";
+        // On RV1106, /dev/video0-10 are CIF (rkcif) capture nodes.
+        // rkaiq binds to the ISP (rkisp_v7) main path at /dev/video11.
+        static const char* VI_VIDEO_DEV = "/dev/video11";
 
         printf("Initialising rkaiq ISP engine (IQ dir: %s)...\n", IQ_DIR);
 
@@ -425,7 +427,16 @@ int main(int argc, char* argv[]) {
                         // ISP now handles white-balance in hardware: neutralise
                         // the software WB gains so softwareJpegLoop is a no-op.
                         camCfg.wbR = camCfg.wbG = camCfg.wbB = 1.0f;
-                        printf("  software WB correction disabled (ISP handles it)\n\n");
+                        printf("  software WB correction disabled (ISP handles it)\n");
+                        // Throttle VPSS pipeline to 10 fps to reduce AXI bus
+                        // contention between rkaiq ISP DMA (running at 30 fps)
+                        // and the RKNN NPU DMA.  The ISP itself still runs at
+                        // sensor rate — only the VPSS group drops 2/3 of frames
+                        // before RGA2 scaling and NPU dispatch.
+                        camCfg.framerate = 10;
+                        printf("  VPSS pipeline throttled to %d fps"
+                               " (ISP stays at 30 fps for AE/AWB)\n\n",
+                               camCfg.framerate);
                     }
                 }
             }

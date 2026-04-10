@@ -62,6 +62,7 @@ static void mbToNv12(void* virt, int width, int height, std::vector<uint8_t>& ou
     // and treat it as compact (width bytes/row) — the VPSS output for
     // COMPRESS_MODE_NONE / RK_FMT_YUV420SP is stride == width when width is
     // already 16-aligned (320 and 640 both are).
+    if (!virt) { out.clear(); return; }
     const size_t sz = static_cast<size_t>(width * height * 3 / 2);
     out.resize(sz);
     memcpy(out.data(), virt, sz);
@@ -74,6 +75,19 @@ static void mbToNv12(void* virt, int width, int height, std::vector<uint8_t>& ou
 void RkmpiCapture::open(const RkmpiConfig& cfg)
 {
     m_cfg = cfg;
+
+    // ── Defensive reset: exit any stale MPI state from a previous process ────
+    //
+    // When yolo_rkmpi is restarted after a stop/start cycle, rkipc may have run
+    // briefly between the two invocations (S99trap stop restarts S21appinit).
+    // The rockit userspace IPC state (shared memory, message queues) can be left
+    // in an inconsistent state that prevents VI from delivering frames to VPSS
+    // (symptom: 0xa006800e on all GetChnFrame calls).
+    //
+    // Calling RK_MPI_SYS_Exit() before Init() resets the userspace MPI state.
+    // It will return an error if MPI is not currently initialised — that is
+    // expected and safe to ignore here.
+    RK_MPI_SYS_Exit();   // ignore error — expected if MPI not previously init'd
 
     // ── Static DMA pool pre-allocation ───────────────────────────────────────
     //
@@ -213,9 +227,17 @@ void RkmpiCapture::initVPSS()
     grpAttr.u32MaxH         = static_cast<RK_U32>(m_cfg.captureHeight);
     grpAttr.enPixelFormat   = RK_FMT_YUV420SP;
     grpAttr.enCompressMode  = COMPRESS_MODE_NONE;
-    // Frame rate -1/-1 = passthrough (no throttling).
-    grpAttr.stFrameRate.s32SrcFrameRate = -1;
-    grpAttr.stFrameRate.s32DstFrameRate = -1;
+    // Frame rate throttle: when m_cfg.framerate > 0 the VPSS group drops input
+    // frames before RGA2 scaling, reducing both RGA2 DMA and downstream NPU DMA.
+    // The ISP itself still runs at the sensor native rate (required by rkaiq for
+    // stable AE/AWB convergence).  Set to -1/-1 for full passthrough.
+    if (m_cfg.framerate > 0) {
+        grpAttr.stFrameRate.s32SrcFrameRate = 30;  // sensor native rate
+        grpAttr.stFrameRate.s32DstFrameRate = m_cfg.framerate;
+    } else {
+        grpAttr.stFrameRate.s32SrcFrameRate = -1;
+        grpAttr.stFrameRate.s32DstFrameRate = -1;
+    }
     check(RK_MPI_VPSS_CreateGrp(VPSS_GRP_ID, &grpAttr), "VPSS_CreateGrp");
 
     // ── Channel 0 — inference (320×320) ──
@@ -467,6 +489,10 @@ void RkmpiCapture::fetchLoop()
         if (ret != RK_SUCCESS) {
             if (!m_shouldStop.load())
                 fprintf(stderr, "[rkmpi] VPSS_GetChnFrame(inf) timeout/err: 0x%x\n", (unsigned)ret);
+            // If the driver returns the error immediately (no blocking) we must
+            // throttle the loop so it doesn't spin and starve the rest of the
+            // system (makes ADB shell unusable and pegs the CPU).
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
 
@@ -485,10 +511,13 @@ void RkmpiCapture::fetchLoop()
         raw.timestampNs = static_cast<uint64_t>(infFrame.stVFrame.u64PTS) * 1000;
 
         void* infVirt = RK_MPI_MB_Handle2VirAddr(infFrame.stVFrame.pMbBlk);
+        // Fall back to pVirAddr[0] if MB_Handle2VirAddr returns null.
+        if (!infVirt) infVirt = infFrame.stVFrame.pVirAddr[0];
         mbToNv12(infVirt, m_cfg.modelWidth, m_cfg.modelHeight, raw.nv12_model);
 
         if (hasFull) {
             void* fullVirt = RK_MPI_MB_Handle2VirAddr(fullFrame.stVFrame.pMbBlk);
+            if (!fullVirt) fullVirt = fullFrame.stVFrame.pVirAddr[0];
             mbToNv12(fullVirt, m_cfg.captureWidth, m_cfg.captureHeight, raw.nv12_fullres);
         }
 
@@ -677,8 +706,15 @@ void RkmpiCapture::softwareJpegLoop()
     // VPSS CHN_STR outputs NV12. CPU converts to RGB before JPEG encoding.
     const size_t nv12Size = static_cast<size_t>(W * H * 3 / 2);
     const size_t rgbSize  = static_cast<size_t>(W * H * 3);
-    std::vector<uint8_t> nv12(nv12Size);
-    std::vector<uint8_t> rgb(rgbSize);
+    // Allocate with 16-byte alignment for libjpeg-turbo NEON SIMD safety.
+    // std::vector heap may only guarantee 8-byte alignment; over-allocate by 15
+    // and align the working pointer manually.
+    std::vector<uint8_t> nv12Buf(nv12Size + 15);
+    std::vector<uint8_t> rgbBuf(rgbSize  + 15);
+    uint8_t* nv12 = reinterpret_cast<uint8_t*>(
+        (reinterpret_cast<uintptr_t>(nv12Buf.data()) + 15u) & ~15u);
+    uint8_t* rgb  = reinterpret_cast<uint8_t*>(
+        (reinterpret_cast<uintptr_t>(rgbBuf.data())  + 15u) & ~15u);
     std::vector<uint8_t> jpeg;
     jpeg.reserve(64 * 1024);
 
@@ -688,27 +724,112 @@ void RkmpiCapture::softwareJpegLoop()
     fprintf(stderr, "[rkmpi] softwareJpegLoop: stb_image_write fallback encoder\n");
 #endif
 
+    int dbgFrames = 0;  // checkpoint counter — printed once per stage
+
     while (!m_shouldStop.load()) {
         VIDEO_FRAME_INFO_S frame{};
         RK_S32 ret = RK_MPI_VPSS_GetChnFrame(VPSS_GRP_ID, VPSS_CHN_STR, &frame, 100);
-        if (ret != RK_SUCCESS) continue;
+        if (ret != RK_SUCCESS) {
+            if (dbgFrames == 0)
+                fprintf(stderr, "[str] GetChnFrame err 0x%x\n", (unsigned)ret);
+            // Throttle: if driver returns error immediately (doesn't honour the
+            // timeout), sleep so we don't spin and starve the system.
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
 
-        // Copy NV12 out immediately and release the VPSS buffer before encoding.
-        void* virt = RK_MPI_MB_Handle2VirAddr(frame.stVFrame.pMbBlk);
-        if (virt) memcpy(nv12.data(), virt, nv12Size);
+        // Map virtual address.  On this BSP pVirAddr[0] is set directly by VPSS;
+        // fall back to MB_Handle2VirAddr if it is null.
+        const auto& vf = frame.stVFrame;
+        void* virt = vf.pVirAddr[0]
+                   ? vf.pVirAddr[0]
+                   : RK_MPI_MB_Handle2VirAddr(vf.pMbBlk);
+
+        if (dbgFrames < 3) {
+            // Diagnose NV12 layout: check actual stride and UV plane address.
+            // If pVirAddr[1]-pVirAddr[0] != W*H the stride > W and the flat
+            // memcpy puts Y data where we expect UV → green colour cast.
+            const ptrdiff_t yuvOffset = (vf.pVirAddr[0] && vf.pVirAddr[1])
+                ? static_cast<ptrdiff_t>(
+                    static_cast<const uint8_t*>(vf.pVirAddr[1]) -
+                    static_cast<const uint8_t*>(vf.pVirAddr[0]))
+                : -1;
+            const uint32_t stride = vf.u32VirWidth ? vf.u32VirWidth : static_cast<uint32_t>(W);
+
+            uint8_t y0 = 0, uv0actual = 0;
+            if (virt) {
+                const auto* b = static_cast<const uint8_t*>(virt);
+                y0 = b[0];
+                // Read first UV byte from actual UV plane (via pVirAddr[1]) if available.
+                if (vf.pVirAddr[1])
+                    uv0actual = static_cast<const uint8_t*>(vf.pVirAddr[1])[0];
+            }
+            fprintf(stderr,
+                "[str] frame=%d virt=%p y0=%02x"
+                " stride=%u yuvOff=%ld WxH=%d uvActual=%02x\n",
+                dbgFrames, virt, (unsigned)y0,
+                (unsigned)stride, (long)yuvOffset, W*H, (unsigned)uv0actual);
+            ++dbgFrames;
+        }
+
+        // Copy NV12 out (stride-aware) then immediately release the VPSS buffer.
+        // pVirAddr[0] = Y plane, pVirAddr[1] = UV plane.  Use the actual UV
+        // plane pointer rather than assuming UV is at Y + W*H, which fails when
+        // the VPSS output stride > W (e.g. 768 for 256-byte DMA alignment).
+        {
+            const uint8_t* srcY  = static_cast<const uint8_t*>(virt);
+            const uint8_t* srcUV = vf.pVirAddr[1]
+                ? static_cast<const uint8_t*>(vf.pVirAddr[1])
+                : (srcY ? srcY + static_cast<size_t>(vf.u32VirWidth ? vf.u32VirWidth : static_cast<uint32_t>(W)) * static_cast<size_t>(H) : nullptr);
+            const size_t rowStride = vf.u32VirWidth ? static_cast<size_t>(vf.u32VirWidth) : static_cast<size_t>(W);
+
+            if (srcY && srcUV) {
+                // Y rows: each stride bytes wide, copy only W bytes per row.
+                for (int row = 0; row < H; ++row)
+                    memcpy(nv12 + row * W, srcY + row * rowStride, static_cast<size_t>(W));
+                // UV rows (H/2 rows, each stride bytes, interleaved U+V pairs).
+                for (int row = 0; row < H / 2; ++row)
+                    memcpy(nv12 + W * H + row * W, srcUV + row * rowStride, static_cast<size_t>(W));
+            }
+        }
         RK_MPI_VPSS_ReleaseChnFrame(VPSS_GRP_ID, VPSS_CHN_STR, &frame);
 
         if (!virt) continue;
 
         // NV12 → RGB (CPU) → JPEG (libjpeg-turbo NEON or stb fallback)
-        nv12_to_rgb_u8(nv12.data(), W, H, rgb.data());
+        nv12_to_rgb_u8(nv12, W, H, rgb);
+
+        // Software white-balance correction.
+        // softwareJpegLoop bypasses MjpegStreamer::encodeFrame(), so WB must be
+        // applied here.  Gains compensate for ISP running without rkaiq AWB/CCM:
+        // IMX415 raw Bayer has a strong green bias and no auto-exposure.
+        {
+            uint8_t* p         = rgb;
+            const uint8_t* end = p + static_cast<size_t>(W * H * 3);
+            const float kR = m_cfg.wbR, kG = m_cfg.wbG, kB = m_cfg.wbB;
+            while (p < end) {
+                float r = p[0] * kR; p[0] = r > 255.f ? 255u : static_cast<uint8_t>(r);
+                float g = p[1] * kG; p[1] = g > 255.f ? 255u : static_cast<uint8_t>(g);
+                float b = p[2] * kB; p[2] = b > 255.f ? 255u : static_cast<uint8_t>(b);
+                p += 3;
+            }
+        }
+
+        // One-shot: log centre pixel to confirm colour conversion is working.
+        static int rgbDbgCount = 0;
+        if (rgbDbgCount < 2) {
+            const uint8_t* px = rgb + (H/2 * W + W/2) * 3;  // centre pixel
+            fprintf(stderr, "[str] rgb-ok frame=%d centre=(%u,%u,%u) nv12[0]=%02x\n",
+                    dbgFrames - 1, (unsigned)px[0], (unsigned)px[1], (unsigned)px[2],
+                    (unsigned)nv12[0]);
+            ++rgbDbgCount;
+        }
 
 #if defined(HAVE_LIBJPEG)
-        jpeg = encodeJpegTurbo(rgb.data(), W, H, m_cfg.jpegQuality);
+        jpeg = encodeJpegTurbo(rgb, W, H, m_cfg.jpegQuality);
 #else
         jpeg.clear();
-        stbi_write_jpg_to_func(stbJpegCallback, &jpeg, W, H, 3,
-                               rgb.data(), m_cfg.jpegQuality);
+        stbi_write_jpg_to_func(stbJpegCallback, &jpeg, W, H, 3, rgb, m_cfg.jpegQuality);
 #endif
         if (!jpeg.empty() && m_jpegCb)
             m_jpegCb(jpeg.data(), jpeg.size());

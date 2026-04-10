@@ -2,9 +2,11 @@
 
 #include <rknn_api.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <thread>
 #include <vector>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -239,8 +241,10 @@ bool RknnInference::infer(const float* inputCHW, FloatMat& out)
 
         // Tear down the current context and DMA buffers, but keep m_modelBytes
         // intact so lazyInitCtx() can recreate everything on the next infer() call.
-        // The NPU kernel driver performs a soft reset after each timeout, so
-        // rknn_init() typically succeeds immediately after this.
+        // The NPU kernel driver performs a soft reset after each timeout.  Wait
+        // briefly before destroy so the driver completes its internal reset before
+        // we attempt further DMA operations (rknn_destroy_mem touches the bus).
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         if (m_outputMem) { rknn_destroy_mem(ctx, m_outputMem); m_outputMem = nullptr; }
         if (m_inputMem)  { rknn_destroy_mem(ctx, m_inputMem);  m_inputMem  = nullptr; }
         rknn_destroy(ctx);
