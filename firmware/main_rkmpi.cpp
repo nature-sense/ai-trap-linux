@@ -118,9 +118,23 @@ int main(int argc, char* argv[]) {
     // causes stats and detection output to disappear into the buffer.
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
-    const char* rknnFile = argc > 1 ? argv[1] : "model.rknn";
-    const char* dbPath   = argc > 2 ? argv[2] : "detections.db";
-    const char* cropsDir = argc > 3 ? argv[3] : "crops";
+    // Parse flags first, then positional args.
+    // --no-rkaiq : skip rkaiq ISP engine init (use software WB; NPU runs unconstrained)
+    bool flagNoRkaiq = false;
+    int  firstPositional = 1;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--no-rkaiq") {
+            flagNoRkaiq = true;
+        } else {
+            // first non-flag positional argument starts here
+            firstPositional = i;
+            break;
+        }
+    }
+    // If all args were flags, firstPositional sits past end — clamp defaults.
+    const char* rknnFile = (firstPositional < argc) ? argv[firstPositional]     : "model.rknn";
+    const char* dbPath   = (firstPositional+1 < argc) ? argv[firstPositional+1] : "detections.db";
+    const char* cropsDir = (firstPositional+2 < argc) ? argv[firstPositional+2] : "crops";
 
     printf("══════════════════════════════════════════════════════════\n");
     printf("  YOLO11n  Luckfox Pico Zero  IMX415 RKMPI+VPSS + RKNN NPU\n");
@@ -376,7 +390,10 @@ int main(int argc, char* argv[]) {
     // On failure (IQ files missing, sensor probe fails, etc.) we fall back
     // gracefully to the empirical software WB correction applied in softwareJpegLoop.
 #ifdef HAVE_RKAIQ
-    {
+    if (flagNoRkaiq) {
+        printf("[rkaiq] --no-rkaiq flag set — skipping ISP engine init"
+               " (software WB, NPU unconstrained)\n\n");
+    } else {
         static const char* IQ_DIR       = "/oem/usr/share/iqfiles";
         // On RV1106, /dev/video0-10 are CIF (rkcif) capture nodes.
         // rkaiq binds to the ISP (rkisp_v7) main path at /dev/video11.
@@ -402,12 +419,13 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "[rkaiq] sysctl_init failed"
                                 " — falling back to software WB\n");
             } else {
-                // Prepare for the configured capture resolution in normal
-                // (non-HDR) mode.  Must be called after init and before start.
+                // rkaiq is prepared at 640×480 (not 1920×1080) to reduce the
+                // ISP output DMA from ~93 MB/s to ~14 MB/s and prevent NPU
+                // AXI bus starvation.  Must be called after init, before start.
+                static const uint32_t AIQ_WIDTH  = 640;
+                static const uint32_t AIQ_HEIGHT = 480;
                 XCamReturn ret = rk_aiq_uapi2_sysctl_prepare(
-                    aiqCtx,
-                    static_cast<uint32_t>(camCfg.captureWidth),
-                    static_cast<uint32_t>(camCfg.captureHeight),
+                    aiqCtx, AIQ_WIDTH, AIQ_HEIGHT,
                     RK_AIQ_WORKING_MODE_NORMAL);
 
                 if (ret != XCAM_RETURN_NO_ERROR) {
@@ -428,15 +446,17 @@ int main(int argc, char* argv[]) {
                         // the software WB gains so softwareJpegLoop is a no-op.
                         camCfg.wbR = camCfg.wbG = camCfg.wbB = 1.0f;
                         printf("  software WB correction disabled (ISP handles it)\n");
-                        // Throttle VPSS pipeline to 10 fps to reduce AXI bus
-                        // contention between rkaiq ISP DMA (running at 30 fps)
-                        // and the RKNN NPU DMA.  The ISP itself still runs at
-                        // sensor rate — only the VPSS group drops 2/3 of frames
-                        // before RGA2 scaling and NPU dispatch.
-                        camCfg.framerate = 10;
-                        printf("  VPSS pipeline throttled to %d fps"
-                               " (ISP stays at 30 fps for AE/AWB)\n\n",
-                               camCfg.framerate);
+                        // Reduce capture resolution to 640×480 to lower ISP
+                        // output DMA from ~93 MB/s (1920×1080 NV12 @30fps) to
+                        // ~14 MB/s (640×480 @30fps).  The ISP sensor input path
+                        // (MIPI → CIF) is unaffected; only the ISP output write
+                        // to DDR is reduced.  rkaiq AE/AWB statistics remain
+                        // valid at 640×480.  Crop saves downgrade gracefully.
+                        camCfg.captureWidth  = 640;
+                        camCfg.captureHeight = 480;
+                        printf("  ISP capture resolution reduced to %dx%d"
+                               " (ISP output DMA: ~14 MB/s vs 93 MB/s @ 1080p)\n\n",
+                               camCfg.captureWidth, camCfg.captureHeight);
                     }
                 }
             }

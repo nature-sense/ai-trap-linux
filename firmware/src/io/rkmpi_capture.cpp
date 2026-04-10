@@ -227,17 +227,12 @@ void RkmpiCapture::initVPSS()
     grpAttr.u32MaxH         = static_cast<RK_U32>(m_cfg.captureHeight);
     grpAttr.enPixelFormat   = RK_FMT_YUV420SP;
     grpAttr.enCompressMode  = COMPRESS_MODE_NONE;
-    // Frame rate throttle: when m_cfg.framerate > 0 the VPSS group drops input
-    // frames before RGA2 scaling, reducing both RGA2 DMA and downstream NPU DMA.
-    // The ISP itself still runs at the sensor native rate (required by rkaiq for
-    // stable AE/AWB convergence).  Set to -1/-1 for full passthrough.
-    if (m_cfg.framerate > 0) {
-        grpAttr.stFrameRate.s32SrcFrameRate = 30;  // sensor native rate
-        grpAttr.stFrameRate.s32DstFrameRate = m_cfg.framerate;
-    } else {
-        grpAttr.stFrameRate.s32SrcFrameRate = -1;
-        grpAttr.stFrameRate.s32DstFrameRate = -1;
-    }
+    // Frame rate -1/-1 = passthrough (no throttling at the VPSS group level).
+    // Reducing VPSS frame rate does NOT reduce ISP output DMA (which is driven
+    // by the sensor at its native rate regardless).  The ISP DMA bottleneck is
+    // addressed by reducing the rkaiq prepare resolution (640×480) instead.
+    grpAttr.stFrameRate.s32SrcFrameRate = -1;
+    grpAttr.stFrameRate.s32DstFrameRate = -1;
     check(RK_MPI_VPSS_CreateGrp(VPSS_GRP_ID, &grpAttr), "VPSS_CreateGrp");
 
     // ── Channel 0 — inference (320×320) ──
