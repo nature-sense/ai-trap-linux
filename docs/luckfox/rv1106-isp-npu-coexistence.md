@@ -264,11 +264,20 @@ These were investigated during the root-cause analysis and are documented here f
 QoS priority register format: `bits[19:16]` = read priority, `bits[3:0]` = write priority.
 Value `0x303` = priority 3 read/write. Max = `0xF000F` = priority 15 read/write.
 
-**Untried but potentially effective:** `SHAPING_NBPKTMAX` at ISP shaping base + 0x008
-(`0xFF130188`) limits ISP max in-flight DDR transactions. U-Boot constrains the NPU to 4
-packets but leaves ISP unconstrained. Setting ISP NBPKTMAX to a small value (e.g. 2) would
-force the ISP to yield DDR more frequently, potentially without the need for one-shot
-convergence. This was superseded by the one-shot approach before it could be tested.
+**Tested and insufficient:** `SHAPING_NBPKTMAX` at `0xFF130188` limits ISP max in-flight
+DDR transactions. Default is 0xFF (unconstrained); U-Boot sets NPU to 4 (`0xFF140088`)
+but leaves ISP unconstrained. Setting ISP NBPKTMAX to 2 was tested with continuous rkaiq:
+
+```
+ISP SHAPING_NBPKTMAX 0xFF130188: 0x000000FF → 0x00000002  ← register write confirmed
+E RKNN: failed to submit!, task run task counter: 40, int status: 0   ← still fails
+E RKNN: failed to submit!, task run task counter: 26, int status: 0   ← and again
+```
+
+The register is writable and the value sticks, but NPU still times out — in fact at
+earlier layers (task 26–40) than without shaping (task 82). Limiting ISP to 2 concurrent
+transactions appears to make each burst hold the DDR bus for longer, worsening the stall.
+The shaping register is NOT a viable alternative to one-shot convergence.
 
 ### MSCH / DDR controller (not accessible from Linux)
 

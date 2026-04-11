@@ -33,6 +33,11 @@
 #include <thread>
 #include <vector>
 
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Class names
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,12 +124,18 @@ int main(int argc, char* argv[]) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
     // Parse flags first, then positional args.
-    // --no-rkaiq : skip rkaiq ISP engine init (use software WB; NPU runs unconstrained)
-    bool flagNoRkaiq = false;
+    // --no-rkaiq        : skip rkaiq ISP engine init (software WB; NPU unconstrained)
+    // --rkaiq-continuous: keep rkaiq running after convergence (no one-shot stop).
+    //                     Used to test whether ISP shaping register (0xFF130188)
+    //                     alone is sufficient to prevent NPU DDR starvation.
+    bool flagNoRkaiq        = false;
+    bool flagRkaiqContinuous = false;
     int  firstPositional = 1;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--no-rkaiq") {
             flagNoRkaiq = true;
+        } else if (std::string(argv[i]) == "--rkaiq-continuous") {
+            flagRkaiqContinuous = true;
         } else {
             // first non-flag positional argument starts here
             firstPositional = i;
@@ -443,64 +454,110 @@ int main(int argc, char* argv[]) {
                     } else {
                         printf("  rkaiq started — running AE/AWB/CCM convergence...\n");
 
-                        // ── One-shot 3A convergence ──────────────────────────
+                        // ── ISP shaping register ─────────────────────────────
                         //
-                        // Root cause: rkaiq's internal threads continuously
-                        // access DDR (stats read, parameter write, 3D-LUT
-                        // updates) while the ISP stats DMA runs at high
-                        // priority.  This starves the NPU's DDR port and
-                        // causes rknn_run() to time out at 6.5 s even though
-                        // the ISP frame bandwidth is only 14 MB/s.
+                        // NIC-400 SHAPING_NBPKTMAX at 0xFF130188 limits the
+                        // number of in-flight DDR transactions the ISP master
+                        // can hold open simultaneously.  U-Boot constrains the
+                        // NPU (0xFF140088 = 4) but leaves ISP unconstrained
+                        // (hardware default ~8–16).  Setting ISP to 2 forces
+                        // it to yield the DDR bus more frequently, potentially
+                        // allowing the NPU to complete its DMA without stalling.
                         //
-                        // NIC-400 QoS changes (0xFF130008/0xFF140008) had no
-                        // effect: the ISP/stats DMA bypasses the NIC-400 fabric
-                        // and the MSCH (DDR controller) is managed by HPMCU
-                        // firmware — not writable from Linux userspace.
-                        //
-                        // Fix: let rkaiq run long enough for AE/AWB to lock,
-                        // then stop it with keep_ext_hw_st=true so the ISP
-                        // hardware retains its calibrated register state
-                        // (AWBGAIN, CCM, gamma, sensor exposure/gain) while
-                        // rkaiq's DDR-heavy threads exit.  VI/RKMPI then starts
-                        // normally; the NPU runs with no rkaiq DDR contention.
-                        //
-                        // Trade-off: AE/AWB do not adapt after convergence.
-                        // For a camera trap in stable outdoor conditions this
-                        // is acceptable.  Periodic re-calibration (restart
-                        // rkaiq for N seconds every M minutes) could be added
-                        // in future if needed.
-                        static const int RKAIQ_CONVERGE_SECS = 5;
-                        printf("  waiting %ds for AE/AWB/CCM to converge...\n",
-                               RKAIQ_CONVERGE_SECS);
-                        std::this_thread::sleep_for(
-                            std::chrono::seconds(RKAIQ_CONVERGE_SECS));
+                        // This is written unconditionally when rkaiq is active.
+                        // In --rkaiq-continuous mode it is the primary fix;
+                        // in one-shot mode it also applies during the 5 s
+                        // convergence window (belt-and-suspenders).
+                        {
+                            static const uintptr_t SHAPING_ISP_NBPKTMAX = 0xFF130188;
+                            static const uint32_t  ISP_MAX_INFLIGHT      = 2;
+                            int   fd  = open("/dev/mem", O_RDWR | O_SYNC);
+                            if (fd < 0) {
+                                fprintf(stderr, "[rkaiq] /dev/mem open failed: %s"
+                                                " — skipping ISP shaping write\n",
+                                        strerror(errno));
+                            } else {
+                                // Map a single page containing the register.
+                                const size_t  PAGE  = 4096;
+                                uintptr_t     base  = SHAPING_ISP_NBPKTMAX & ~(PAGE - 1);
+                                size_t        off   = SHAPING_ISP_NBPKTMAX - base;
+                                void*         map   = mmap(nullptr, PAGE,
+                                                            PROT_READ | PROT_WRITE,
+                                                            MAP_SHARED, fd, (off_t)base);
+                                if (map == MAP_FAILED) {
+                                    fprintf(stderr, "[rkaiq] mmap 0x%08zX failed: %s"
+                                                    " — skipping ISP shaping write\n",
+                                            (size_t)base, strerror(errno));
+                                } else {
+                                    volatile uint32_t* reg =
+                                        (volatile uint32_t*)((uint8_t*)map + off);
+                                    uint32_t before = *reg;
+                                    *reg = ISP_MAX_INFLIGHT;
+                                    uint32_t after  = *reg;
+                                    printf("  ISP SHAPING_NBPKTMAX 0x%08X:"
+                                           " 0x%08X → 0x%08X (target %u)\n",
+                                           (unsigned)SHAPING_ISP_NBPKTMAX,
+                                           before, after, ISP_MAX_INFLIGHT);
+                                    munmap(map, PAGE);
+                                }
+                                close(fd);
+                            }
+                        }
 
-                        // Stop rkaiq — preserve ISP hardware state.
-                        // keep_ext_hw_st=true: sensor exposure/gain registers
-                        // and ISP hardware (AWBGAIN, CCM, gamma LUT) are NOT
-                        // reset.  The ISP continues processing with the last
-                        // calibrated parameters.  rkaiq's DMA threads exit.
-                        XCamReturn stopRet = rk_aiq_uapi2_sysctl_stop(
-                            aiqCtx, /*keep_ext_hw_st=*/true);
-                        if (stopRet != XCAM_RETURN_NO_ERROR)
-                            fprintf(stderr, "[rkaiq] sysctl_stop returned %d"
-                                            " (non-fatal)\n", stopRet);
-                        rk_aiq_uapi2_sysctl_deinit(aiqCtx);
-                        aiqCtx = nullptr;   // skip stop in shutdown path
+                        if (flagRkaiqContinuous) {
+                            // ── Continuous rkaiq mode ────────────────────────
+                            // rkaiq keeps running; AE/AWB adapt in real time.
+                            // ISP shaping register (written above) is the only
+                            // DDR-contention mitigation.  Used to test whether
+                            // shaping alone is sufficient (if so, continuous
+                            // mode can replace one-shot for adaptive AE/AWB).
+                            printf("  --rkaiq-continuous: rkaiq stays running"
+                                   " — AE/AWB/CCM will adapt continuously\n");
+                            printf("  ISP shaping (NBPKTMAX=2) is the sole"
+                                   " NPU DDR protection — watching for timeouts\n\n");
+                            // aiqCtx remains non-null; shutdown path will stop it.
+                        } else {
+                            // ── One-shot 3A convergence ──────────────────────
+                            //
+                            // Root cause: rkaiq's internal threads continuously
+                            // access DDR (stats read, parameter write, 3D-LUT
+                            // updates) while the ISP stats DMA runs at high
+                            // priority.  This starves the NPU's DDR port and
+                            // causes rknn_run() to time out at 6.5 s even though
+                            // the ISP frame bandwidth is only 14 MB/s.
+                            //
+                            // Fix: let rkaiq run long enough for AE/AWB to lock,
+                            // then stop it with keep_ext_hw_st=true so the ISP
+                            // hardware retains its calibrated register state
+                            // (AWBGAIN, CCM, gamma, sensor exposure/gain) while
+                            // rkaiq's DDR-heavy threads exit.  VI/RKMPI then
+                            // starts normally with no rkaiq DDR contention.
+                            static const int RKAIQ_CONVERGE_SECS = 5;
+                            printf("  waiting %ds for AE/AWB/CCM to converge...\n",
+                                   RKAIQ_CONVERGE_SECS);
+                            std::this_thread::sleep_for(
+                                std::chrono::seconds(RKAIQ_CONVERGE_SECS));
 
-                        printf("  rkaiq stopped — ISP holds calibrated"
-                               " AE/AWB/CCM/gamma; NPU DDR conflict eliminated\n");
+                            // Stop rkaiq — preserve ISP hardware state.
+                            XCamReturn stopRet = rk_aiq_uapi2_sysctl_stop(
+                                aiqCtx, /*keep_ext_hw_st=*/true);
+                            if (stopRet != XCAM_RETURN_NO_ERROR)
+                                fprintf(stderr, "[rkaiq] sysctl_stop returned %d"
+                                                " (non-fatal)\n", stopRet);
+                            rk_aiq_uapi2_sysctl_deinit(aiqCtx);
+                            aiqCtx = nullptr;   // skip stop in shutdown path
 
-                        // ISP hardware handles WB in hardware — disable
-                        // the software WB correction applied in softwareJpegLoop.
+                            printf("  rkaiq stopped — ISP holds calibrated"
+                                   " AE/AWB/CCM/gamma; NPU DDR conflict eliminated\n");
+                        }
+
+                        // ISP hardware handles WB — disable software correction.
                         camCfg.wbR = camCfg.wbG = camCfg.wbB = 1.0f;
                         printf("  software WB correction disabled"
                                " (ISP hardware holds AWB gains)\n");
 
-                        // Restore full capture resolution now that rkaiq's
-                        // DDR DMA is gone.  VI alone at 1080p30 (~93 MB/s)
-                        // does not starve the NPU — confirmed by --no-rkaiq
-                        // testing.  Better crop saves result.
+                        // Restore full capture resolution.  VI alone at 1080p30
+                        // does not starve the NPU (confirmed by --no-rkaiq).
                         camCfg.captureWidth  = 1920;
                         camCfg.captureHeight = 1080;
                         printf("  capture resolution restored to %dx%d\n\n",
