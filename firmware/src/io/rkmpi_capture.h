@@ -34,9 +34,12 @@
 //  ISP note
 //  ────────
 //  rkipc must be stopped before open() — it holds the VI dev exclusively.
-//  Do NOT start rkaiq_3A_server. ISP runs with static config from the
-//  kernel device tree (same "green tint without AWB" as the V4L2 path).
-//  Manual white-balance gains in MjpegStreamerConfig compensate.
+//  rkaiq is used for one-shot 3A convergence (see main_rkmpi.cpp): it runs
+//  for ~5 s before open() so AE/AWB/CCM lock, then stops with
+//  keep_ext_hw_st=true so the ISP hardware retains calibrated register state.
+//  After rkaiq stops, the ISP continues with fixed AE/AWB/CCM — no ongoing
+//  rkaiq DDR DMA that would starve the NPU.  wbR/wbG/wbB are set to 1.0
+//  when rkaiq has converged (ISP hardware handles WB in hardware).
 //
 //  IRQ note
 //  ────────
@@ -97,6 +100,16 @@ struct RkmpiConfig {
     // Set false to skip VENC init and VPSS chn1 — useful for testing inference
     // without hardware MJPEG encoding.
     bool enableVenc = true;
+
+    // Software white-balance gains applied after NV12→RGB in softwareJpegLoop.
+    // Compensates for IMX415 Bayer sensor running without rkaiq AWB/CCM on RV1106:
+    // the raw ISP output has a strong green bias (Bayer GBRG, 2:1 green pixels)
+    // and is underexposed (no auto-exposure).
+    // Empirically measured from a white target: R≈39, G≈101, B≈61 raw → target 180.
+    // Applied only to the stream JPEG — not to the model NV12 input.
+    float wbR = 4.57f;
+    float wbG = 1.77f;
+    float wbB = 2.95f;
 };
 
 // ── Frame delivered to the callback ───────────────────────────────────────────

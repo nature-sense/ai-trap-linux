@@ -198,20 +198,25 @@ push_files() {
 # RkLunch.sh at boot) holds the VI device open and will conflict.  We stop
 # rkipc before starting yolo_rkmpi, and restart it on stop.
 #
-# rkaiq ISP engine (--no-rkaiq flag): rkaiq in-process (librkaiq.so) has been
-# disabled because it causes the ISP to claim full AXI bus ownership, starving
-# the NPU DMA completely (irq status 0x0 after 6.5 s; all inference times out).
-# Root cause: RV1106 ISP has hard-coded highest NOC bus priority; no QoS
-# configuration is exposed in sysfs.  The same librkaiq.so is on /oem/usr/lib
-# (OEM version = GitHub version, same git hash 25bd14e), ruling out version
-# mismatch.  Software WB correction (4.57 R / 1.77 G / 2.95 B) is applied
-# instead.  Remove --no-rkaiq to re-enable rkaiq if a bus QoS fix is found.
+# rkaiq ISP engine: runs one-shot 3A convergence (see main_rkmpi.cpp).
+# yolo_rkmpi starts rkaiq, waits 5 s for AE/AWB/CCM to lock, then stops
+# rkaiq with keep_ext_hw_st=true.  The ISP hardware retains calibrated
+# register state (AWBGAIN, CCM, gamma, sensor exposure/gain) while rkaiq's
+# DDR-heavy algorithm threads exit.  VI/RKMPI then starts with the frozen
+# ISP calibration and the NPU runs without DDR contention.
+#
+# Previous workaround (--no-rkaiq with software WB 4.57R/1.77G/2.95B) is
+# no longer needed.  Root cause was rkaiq's ongoing stats/param DMA threads
+# starving the NPU DDR port — fixed by stopping rkaiq after convergence.
+# The MSCH/DDR arbiter (0xFF800000) and NIC-400 QoS (0xFF130008/0xFF140008)
+# were investigated and confirmed inaccessible/ineffective from Linux
+# userspace; one-shot convergence is the correct software-only fix.
 #
 # bypass_irq_handler=1: switches the NPU from interrupt-driven to polling mode.
 # On RV1106, the ISP DMA interrupt can starve the NPU completion interrupt
 # (IRQ 37) at Conv:/model.8 (task 85 of 113), causing a 6-second rknn_run
-# timeout.  Polling bypasses the interrupt path entirely.  Still needed even
-# without rkaiq for robustness against any ISP/CIF DMA interference.
+# timeout.  Polling bypasses the interrupt path entirely.  Still needed for
+# robustness against any ISP/CIF DMA interference during frame capture.
 
 INSTALL_DIR=/opt/trap
 BINARY=$INSTALL_DIR/yolo_rkmpi
@@ -242,7 +247,7 @@ case "$1" in
     # completion interrupt (IRQ 37) at Conv:/model.8 (task 85 of 113).
     echo 1 > /sys/module/rknpu/parameters/bypass_irq_handler
     cd "$INSTALL_DIR"
-    "$BINARY" --no-rkaiq \
+    "$BINARY" \
         "$INSTALL_DIR/model.rknn" \
         "$INSTALL_DIR/detections.db" \
         "$INSTALL_DIR/crops" \
